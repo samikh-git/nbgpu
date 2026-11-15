@@ -82,6 +82,14 @@ def test_gitignore_edits_take_effect_after_refresh(tmp_path: Path) -> None:
     assert rules.is_ignored("out/a.py")
 
 
+def test_git_info_exclude_edits_take_effect_after_refresh(tmp_path: Path) -> None:
+    rules = IgnoreRules(tmp_path)  # no .git yet
+    assert not rules.is_ignored("scratch/a.py")
+    _write(tmp_path, ".git/info/exclude", "scratch/\n")
+    rules.refresh()
+    assert rules.is_ignored("scratch/a.py")
+
+
 # --------------------------------------------------------------------------
 # spec
 

@@ -3,7 +3,8 @@
 - One Modal App, looked up or created by name (`app_name`, default "nbgpu").
 - Image: debian_slim with the notebook's Python version (from
   requires-python when it pins one, else the local minor version), plus
-  `uv_pip_install` of the spec's dependencies, marimo, and watchdog.
+  `uv_pip_install` of the spec's dependencies plus BASE_PACKAGES (marimo,
+  watchdog, uv).
 - `create` -> modal.Sandbox.create with gpu, cpu, memory, timeout
   (max_runtime_s), idle_timeout (IDLE_GRACE_S, see below), volumes looked up by name,
   encrypted_ports for request.ports, tags (passed to Sandbox.create, which
@@ -97,6 +98,7 @@ from nbgpu.backends.base import (
     CAP_LIVE_INSTALL,
     CAP_MAX_RUNTIME,
     CAP_VOLUMES,
+    EXCLUDED_PARTS,
     TEMP_PREFIX,
     BackendError,
     ExecResult,
@@ -106,7 +108,7 @@ from nbgpu.backends.base import (
     SpendRow,
     UnsupportedError,
 )
-from nbgpu.spec import NotebookSpec
+from nbgpu.spec import NotebookSpec, requirement_name
 
 if TYPE_CHECKING:  # pragma: no cover
     import modal
@@ -189,7 +191,6 @@ INTERNAL_TAG_PREFIX = "nbgpu.internal."
 TAG_CREATED_AT = INTERNAL_TAG_PREFIX + "created_at"
 TAG_PORTS = INTERNAL_TAG_PREFIX + "ports"
 
-HASH_EXCLUDED_PARTS: tuple[str, ...] = (".git", ".venv", "__pycache__", "node_modules")
 HASH_CACHE_NAME = "nbgpu-hash-cache.json"
 
 # Set on every command this backend runs for its own purposes (hashing, the
@@ -448,8 +449,8 @@ KILL_CODE = (
     "            os.killpg(pg, 0)\n"
     "            time.sleep(0.1)\n"
     "        os.killpg(pg, signal.SIGKILL)\n"
-    "    except (ProcessLookupError, PermissionError):\n"  # gone (EPERM: only zombies left, on some kernels)
-
+    # Gone (EPERM: only zombies left, on some kernels).
+    "    except (ProcessLookupError, PermissionError):\n"
     "        pass\n"
     "    try:\n"
     "        os.unlink(path)\n"
@@ -484,20 +485,10 @@ def parse_gpu(gpu: str | None) -> str | None:
     return name if count == 1 else f"{name}:{count}"
 
 
-def _requirement_name(requirement: str) -> str:
-    """The normalized distribution name of a requirement string (PEP 503)."""
-    match = re.match(r"\s*([A-Za-z0-9][A-Za-z0-9._-]*)", requirement)
-    if not match:
-        return requirement.strip().lower()
-    return re.sub(r"[-_.]+", "-", match.group(1)).lower()
-
-
 def local_marimo_version() -> str | None:
     """The marimo version installed next to nbgpu, or None."""
-    try:
-        from importlib.metadata import PackageNotFoundError, version
-    except ImportError:  # pragma: no cover
-        return None
+    from importlib.metadata import PackageNotFoundError, version
+
     try:
         return version("marimo")
     except PackageNotFoundError:
@@ -525,7 +516,7 @@ def image_packages(dependencies: Sequence[str], marimo_version: str | None = Non
         if not dep or dep in seen_reqs:
             continue
         seen_reqs.add(dep)
-        names.add(_requirement_name(dep))
+        names.add(requirement_name(dep))
         out.append(_pin_marimo(dep, marimo_version))
     for base in BASE_PACKAGES:
         if base not in names:
@@ -785,7 +776,7 @@ def write_first_args(path: str, data: bytes) -> list[str]:
 def hash_argv(root: str, cache_path: str, write_first: tuple[str, bytes] | None = None) -> list[str]:
     pre = write_first_args(*write_first) if write_first is not None else []
     return [REMOTE_PYTHON, "-c", WRITE_FIRST_CODE + HASH_CODE, *pre, root, TEMP_PREFIX, cache_path,
-            *HASH_EXCLUDED_PARTS]
+            *sorted(EXCLUDED_PARTS)]
 
 
 def launch_argv(pidfile: str, argv: Sequence[str]) -> list[str]:

@@ -118,10 +118,12 @@ def test_marimo_argv_substitutes_in_one_pass() -> None:
 
 
 def test_private_dir_modes(tmp_path: Path) -> None:
+    from nbgpu.session import ensure_private_dir
+
     created = tmp_path / "new"
     old = os.umask(0o022)
     try:
-        lifecycle._ensure_private_dir(created)
+        ensure_private_dir(created)
     finally:
         os.umask(old)
     assert stat.S_IMODE(created.stat().st_mode) == 0o700
@@ -129,7 +131,7 @@ def test_private_dir_modes(tmp_path: Path) -> None:
     existing = tmp_path / "existing"
     existing.mkdir(mode=0o755)
     existing.chmod(0o755)
-    lifecycle._ensure_private_dir(existing)
+    ensure_private_dir(existing)
     assert stat.S_IMODE(existing.stat().st_mode) == 0o700
 
 
@@ -362,7 +364,7 @@ class SlowCreate(FakeBackend):
         self.seen: list[tuple] = []
 
     def create(self, request):  # type: ignore[no-untyped-def]
-        handle = super().create(request)  # exists at the provider already
+        super().create(request)  # exists at the provider already
         [record] = self.store.list()
         orphans = lifecycle.find_orphans(backends={"fake": self}, store=self.store)
         [entry] = lifecycle.status(backends={"fake": self}, store=self.store)

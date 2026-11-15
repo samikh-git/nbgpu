@@ -9,6 +9,12 @@ Paths given to file operations are POSIX paths relative to the runtime's
 `remote_root` unless they are absolute; absolute paths are used as-is.
 `env` passed to exec/spawn is added to the runtime's environment, never a
 replacement for it.
+
+Optional method, looked up with getattr by the sync engine's initial push:
+`write_new_files(handle, files: Mapping[str, bytes]) -> set[str]` creates
+many files under remote_root in one round trip, never overwriting an
+existing one, and returns the paths it wrote. Without it, the push writes
+file by file with write_file(expect=ABSENT).
 """
 
 from __future__ import annotations
@@ -38,6 +44,13 @@ CAP_BILLING = "billing"
 # Prefix for temporary files made by atomic writes, locally and remotely.
 # Sync never treats such files as project files.
 TEMP_PREFIX = ".nbgpu-tmp-"
+
+# Directory names never synced and left out of hash_files: version control,
+# environments, caches, and marimo's per-notebook session state. (The idle
+# watchdog keeps a stdlib-only copy, tested to match.)
+EXCLUDED_PARTS: frozenset[str] = frozenset(
+    {".git", ".venv", "__pycache__", "node_modules", ".nbgpu", "__marimo__"}
+)
 
 # `expect` value for write_file meaning "only if the file does not exist".
 ABSENT = ""
@@ -180,8 +193,7 @@ class Backend(Protocol):
         self, handle: RuntimeHandle, root: str = ".", *, write_first: tuple[str, bytes] | None = None
     ) -> dict[str, str]:
         """Every regular file under `root`: POSIX path relative to `root` ->
-        SHA-256 hex. Paths whose parts include .git, .venv, __pycache__ or
-        node_modules are left out.
+        SHA-256 hex. Paths with a part in EXCLUDED_PARTS are left out.
 
         `write_first` = (absolute path outside `root`, bytes): written
         atomically before hashing, in the same round trip (the sync loop sends

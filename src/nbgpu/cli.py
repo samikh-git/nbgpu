@@ -104,7 +104,7 @@ from typing import Any, NoReturn
 
 import click
 
-from nbgpu import cost, lifecycle
+from nbgpu import cost, lifecycle, watchdog
 from nbgpu.backends import get_backend
 from nbgpu.backends.base import Backend, RuntimeHandle
 from nbgpu.cost import Rate, format_usd
@@ -191,10 +191,6 @@ def _emit_json(data: object) -> None:
     click.echo(json.dumps(data, indent=2))
 
 
-def _warnings(report: SyncReport) -> list[str]:
-    return list(getattr(report, "warnings", None) or [])
-
-
 def _report_json(report: SyncReport) -> dict[str, list[str]]:
     return {
         "pushed": report.pushed,
@@ -202,7 +198,7 @@ def _report_json(report: SyncReport) -> dict[str, list[str]]:
         "merged": report.merged,
         "conflicts": report.conflicts,
         "skipped": report.skipped,
-        "warnings": _warnings(report),
+        "warnings": report.warnings,
     }
 
 
@@ -317,7 +313,7 @@ def _print_report(report: SyncReport, *, quiet_when_empty: bool = False, err: bo
           + _c("(remote version saved next to it as .remote; delete that copy to resolve)", "dim")
           for p in report.conflicts),
     ]
-    warnings = [f"{_c('warning:', 'warn')} {w}" for w in _warnings(report)]
+    warnings = [f"{_c('warning:', 'warn')} {w}" for w in report.warnings]
     if not lines and not warnings and not quiet_when_empty:
         lines = [_c("nothing to sync", "dim")]
     for line in lines:
@@ -370,6 +366,12 @@ def _unsynced_note(idle_timeout_s: float | None, grace_s: float | None) -> str:
     )
 
 
+def _say_stopped_elsewhere(session: Session, *, err: bool) -> None:
+    """The record is gone: `nbgpu stop` elsewhere pulled and terminated."""
+    _say(f"{_c('✓', 'ok')} session {_c(session.session_id, 'id')} was stopped (by `nbgpu stop`); "
+         "its files were pulled first. Stopped syncing.", err=err)
+
+
 class _WatchdogMonitor:
     """Tells, with one file read per tick, whether the idle watchdog stopped
     marimo (returns its marker), and restarts the watchdog if it died."""
@@ -380,10 +382,10 @@ class _WatchdogMonitor:
         self.next_restart = 0.0
 
     def _stale_after(self) -> float:
-        interval = watchdog_interval = 30.0  # watchdog.CHECK_INTERVAL_S's default
+        interval = watchdog.CHECK_INTERVAL_S
         if self.last is not None:
             try:
-                interval = float(json.loads(self.last).get("interval", watchdog_interval))
+                interval = float(json.loads(self.last).get("interval", interval))
             except (ValueError, TypeError, AttributeError):
                 pass
         return 3 * interval + WATCHDOG_STALE_SLACK_S
@@ -462,9 +464,7 @@ def _sync_loop(
         try:
             while True:
                 if store.load(session.session_id) is None:
-                    # `nbgpu stop` elsewhere did the final pull and removed the record.
-                    _say(f"{_c('✓', 'ok')} session {_c(session.session_id, 'id')} was stopped (by `nbgpu stop`); "
-                         "its files were pulled first. Stopped syncing.", err=err)
+                    _say_stopped_elsewhere(session, err=err)
                     return
                 if packages is not None:
                     _record_packages(session, packages, env_watcher, err=err)
@@ -472,8 +472,7 @@ def _sync_loop(
                     if engine is None or handle is None:
                         handle = backend.get(session.runtime_id)
                         if handle is None and store.load(session.session_id) is None:
-                            _say(f"{_c('✓', 'ok')} session {_c(session.session_id, 'id')} was stopped (by `nbgpu stop`); "
-                                 "its files were pulled first. Stopped syncing.", err=err)
+                            _say_stopped_elsewhere(session, err=err)
                             return
                         if handle is None:
                             raise lifecycle.SessionNotRunning(
@@ -501,9 +500,7 @@ def _sync_loop(
                     except Exception:  # noqa: BLE001
                         pass
                     if gone and store.load(session.session_id) is None:
-                        # `nbgpu stop` in another terminal did the final pull and removed the record.
-                        _say(f"{_c('✓', 'ok')} session {_c(session.session_id, 'id')} was stopped (by `nbgpu stop`); "
-                             "its files were pulled first. Stopped syncing.", err=err)
+                        _say_stopped_elsewhere(session, err=err)
                         return
                     if gone:
                         raise lifecycle.SessionNotRunning(
@@ -516,8 +513,7 @@ def _sync_loop(
                     last_conflicts = report.conflicts
                     shown = SyncReport(report.pushed, report.pulled, report.merged,
                                        report.conflicts if new_conflicts else [],
-                                       report.skipped if report.changed else [])
-                    shown.warnings = _warnings(report)  # type: ignore[attr-defined]
+                                       report.skipped if report.changed else [], report.warnings)
                     _print_report(shown, quiet_when_empty=True, err=err)
                     if env_watcher is not None:
                         try:

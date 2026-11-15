@@ -28,6 +28,8 @@ from pathlib import Path, PurePosixPath
 import pathspec
 
 GITIGNORE = ".gitignore"
+# Cache key for .git/info/exclude; "\0" cannot be part of a directory path.
+_INFO_EXCLUDE_KEY = "\0info/exclude"
 
 
 def _spec(lines: Iterable[str]) -> pathspec.GitIgnoreSpec | None:
@@ -39,9 +41,9 @@ class IgnoreRules:
     def __init__(self, root: Path, exclude: Sequence[str] = ()) -> None:
         self._root = Path(root)
         self._exclude = _spec(exclude)
-        # directory rel path ("" for root) -> ((size, mtime_ns) or None, spec or None)
+        # directory rel path ("" for root), or _INFO_EXCLUDE_KEY ->
+        # ((size, mtime_ns) or None, spec or None)
         self._cache: dict[str, tuple[tuple[int, int] | None, pathspec.GitIgnoreSpec | None]] = {}
-        self._info_exclude = self._read(self._root / ".git" / "info" / "exclude")
         self._dir_memo: dict[str, bool] = {}
 
     @property
@@ -50,7 +52,7 @@ class IgnoreRules:
 
     def refresh(self) -> None:
         """Forget memoised directory answers; call once per scan so edits to
-        .gitignore files are picked up."""
+        .gitignore files (and .git/info/exclude) are picked up."""
         self._dir_memo.clear()
 
     @staticmethod
@@ -62,23 +64,30 @@ class IgnoreRules:
 
     def _gitignore(self, dir_rel: str) -> pathspec.GitIgnoreSpec | None:
         path = self._root / dir_rel / GITIGNORE if dir_rel else self._root / GITIGNORE
+        return self._cached(dir_rel, path)
+
+    def _info_exclude(self) -> pathspec.GitIgnoreSpec | None:
+        return self._cached(_INFO_EXCLUDE_KEY, self._root / ".git" / "info" / "exclude")
+
+    def _cached(self, key_name: str, path: Path) -> pathspec.GitIgnoreSpec | None:
+        """The rules in `path`, re-read only when its size or mtime changes."""
         try:
             st = os.stat(path)
             key: tuple[int, int] | None = (st.st_size, st.st_mtime_ns)
         except OSError:
             key = None
-        cached = self._cache.get(dir_rel)
+        cached = self._cache.get(key_name)
         if cached is not None and cached[0] == key:
             return cached[1]
         spec = self._read(path) if key is not None else None
-        self._cache[dir_rel] = (key, spec)
+        self._cache[key_name] = (key, spec)
         return spec
 
     def _match(self, rel: str, is_dir: bool) -> bool:
         """Whether `rel` itself is matched (ignoring its parents)."""
         parts = PurePosixPath(rel).parts
         verdict = False
-        layers: list[tuple[str, pathspec.GitIgnoreSpec | None]] = [("", self._info_exclude)]
+        layers: list[tuple[str, pathspec.GitIgnoreSpec | None]] = [("", self._info_exclude())]
         for depth in range(len(parts)):  # the directories holding rel, root first
             layers.append(("/".join(parts[:depth]), self._gitignore("/".join(parts[:depth]))))
         layers.append(("", self._exclude))

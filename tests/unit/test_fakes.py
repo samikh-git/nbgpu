@@ -51,8 +51,7 @@ def test_hash_files_exclusions_and_root() -> None:
     assert hashes == {
         "a.py": hashlib.sha256(b"a.py").hexdigest(),
         "sub/b.txt": hashlib.sha256(b"sub/b.txt").hexdigest(),
-        ".nbgpu/state.json": hashlib.sha256(b".nbgpu/state.json").hexdigest(),
-    }
+    }  # .nbgpu is in EXCLUDED_PARTS like the others
     assert fb.hash_files(h, "sub") == {"b.txt": hashlib.sha256(b"sub/b.txt").hexdigest()}
     assert fb.hash_calls == 2
 

@@ -114,6 +114,7 @@ from nbgpu.session import (
     Session,
     SessionStore,
     default_state_dir,
+    ensure_private_dir,
     new_session_id,
     new_token,
     notebook_tag,
@@ -378,18 +379,14 @@ def find_project_root(notebook: Path) -> Path:
     return notebook.parent
 
 
-def _excluded_parts() -> frozenset[str]:
-    return frozenset(getattr(sync, "EXCLUDED_PARTS", frozenset({".git", ".venv", "__pycache__", "node_modules"})))
-
-
 def check_push_size(root: Path, exclude: Sequence[str] = ()) -> tuple[int, int]:
     """Count the files and bytes an initial push of `root` would upload
     (excluded directories and files over sync's per-file limit left out).
     Raises StartError once either exceeds PUSH_MAX_FILES /
     PUSH_MAX_TOTAL_BYTES; returns (files, bytes) otherwise."""
-    excluded = _excluded_parts()
+    excluded = sync.EXCLUDED_PARTS
     ignore = IgnoreRules(root, exclude)
-    per_file_max = getattr(sync, "PUSH_MAX_BYTES", None)
+    per_file_max = sync.PUSH_MAX_BYTES  # module global, read now
     max_files, max_bytes = PUSH_MAX_FILES, PUSH_MAX_TOTAL_BYTES
     files = total = 0
     for dirpath, dirnames, filenames in os.walk(root):
@@ -405,7 +402,7 @@ def check_push_size(root: Path, exclude: Sequence[str] = ()) -> tuple[int, int]:
                 st = os.stat(os.path.join(dirpath, name))
             except OSError:
                 continue
-            if not stat.S_ISREG(st.st_mode) or (per_file_max is not None and st.st_size > per_file_max):
+            if not stat.S_ISREG(st.st_mode) or st.st_size > per_file_max:
                 continue
             files += 1
             total += st.st_size
@@ -434,7 +431,7 @@ def _check_state_dir_outside(root: Path, state_dir: Path) -> None:
         rel = Path(state_dir).resolve().relative_to(Path(root).resolve())
     except ValueError:
         return
-    if any(part in _excluded_parts() for part in rel.parts):
+    if any(part in sync.EXCLUDED_PARTS for part in rel.parts):
         return  # sync never looks inside it
     raise StartError(
         f"the nbgpu state directory {state_dir} is inside the project directory {root}, so its tokens "
@@ -448,9 +445,7 @@ def runtime_path(handle: RuntimeHandle, name: str) -> str:
 
 
 def token_path(handle: RuntimeHandle) -> str:
-    """`nbgpu-token` next to the remote project directory:
-    posixpath.join(posixpath.dirname(handle.remote_root), "nbgpu-token").
-    Per runtime, and outside what is synced."""
+    """marimo's access token file: per runtime, outside what is synced."""
     return runtime_path(handle, TOKEN_NAME)
 
 
@@ -505,7 +500,7 @@ def owner_id(store: SessionStore) -> str:
         existing = path.read_text(encoding="utf-8").strip()
         if existing:
             return existing
-    _ensure_private_dir(store.directory)
+    ensure_private_dir(store.directory)
     value = secrets.token_hex(8)
     fd, tmp = tempfile.mkstemp(dir=store.directory, prefix=".owner-", suffix=".tmp")
     try:
@@ -694,21 +689,6 @@ def _rate_extra(rate: Rate | None) -> dict[str, str]:
     }
 
 
-def _ensure_private_dir(directory: Path) -> None:
-    """Make sure `directory` exists and only the user can use it: created
-    0700, and an existing one we own has group/other permissions removed."""
-    directory = Path(directory)
-    directory.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        directory.mkdir(mode=0o700)
-    except FileExistsError:
-        st = directory.stat()
-        if st.st_uid == os.getuid() and stat.S_IMODE(st.st_mode) & 0o077:
-            directory.chmod(stat.S_IMODE(st.st_mode) & 0o700)
-        return
-    directory.chmod(0o700)  # mkdir's mode is filtered by the umask
-
-
 def _private_file(path: Path) -> None:
     with contextlib.suppress(FileNotFoundError):
         path.chmod(0o600)
@@ -866,9 +846,16 @@ def _state_path(session: Session, store: SessionStore | None) -> Path:
 
 
 def _new_engine(
-    root: Path, backend: Backend, handle: RuntimeHandle, state_path: Path, exclude: Sequence[str] = ()
+    root: Path,
+    backend: Backend,
+    handle: RuntimeHandle,
+    state_path: Path,
+    exclude: Sequence[str] = (),
+    *,
+    defer_manifest: bool = False,
 ) -> SyncEngine:
-    return SyncEngine(root, backend, handle, state_path, manifest_path=manifest_path(handle), exclude=exclude)
+    return SyncEngine(root, backend, handle, state_path, manifest_path=manifest_path(handle), exclude=exclude,
+                      defer_manifest=defer_manifest)
 
 
 def session_exclude(session: Session) -> tuple[str, ...]:
@@ -896,8 +883,8 @@ def session_engine(
     handle = _require_handle(session, backend)
     state_path = sync_state_path(session.session_id, store)
     _private_file(state_path)
-    return SyncEngine(session.project_root, backend, handle, state_path, manifest_path=manifest_path(handle),
-                      exclude=session_exclude(session), defer_manifest=defer_manifest)
+    return _new_engine(session.project_root, backend, handle, state_path, session_exclude(session),
+                       defer_manifest=defer_manifest)
 
 
 # ---------------------------------------------------------------------------
@@ -934,7 +921,7 @@ def _start(
     notebook = spec.path
     root = Path(project_root).resolve() if project_root is not None else find_project_root(notebook)
     rel_notebook = _relative_notebook(notebook, root)
-    _ensure_private_dir(store.directory)
+    ensure_private_dir(store.directory)
     _check_state_dir_outside(root, store.directory)
     _check_notebook_not_ignored(rel_notebook, root, spec.exclude)
     files, size = check_push_size(root, spec.exclude)
@@ -1278,8 +1265,7 @@ def _forget(session: Session, store: SessionStore) -> None:
 
 
 def _with_warnings(report: SyncReport, *warnings: str) -> SyncReport:
-    existing = list(getattr(report, "warnings", None) or [])
-    report.warnings = existing + [w for w in warnings if w not in existing]  # type: ignore[attr-defined]
+    report.warnings += [w for w in warnings if w not in report.warnings]
     return report
 
 
@@ -1501,7 +1487,7 @@ def _run_in(
         return RunResult(result.exit_code, "\n".join(lines), False, None)
 
     if not output_dir.exists():
-        _ensure_private_dir(output_dir)
+        ensure_private_dir(output_dir)
     stem = posixpath.splitext(posixpath.basename(rel_notebook))[0]
     fd, name = tempfile.mkstemp(prefix=f"{stem}-{time.strftime('%Y%m%d-%H%M%S')}-", suffix=".log", dir=output_dir)
     full_path = Path(name)

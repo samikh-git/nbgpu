@@ -497,6 +497,8 @@ def test_hash_files_matches_hashlib_and_applies_exclusions(backend: Backend, han
         "d/__pycache__/q.pyc": b"\x00",
         "node_modules/pkg/index.js": b"module.exports = 1\n",
         "d/node_modules/x.js": b"",
+        "__marimo__/session/nb.py.json": b"{}",
+        ".nbgpu/state": b"",
     }
     for rel, data in {**included, **excluded}.items():
         backend.write_file(handle, f"{workdir}/hf/{rel}", data)

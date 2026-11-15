@@ -83,6 +83,7 @@ from typing import Any
 
 from nbgpu.backends.base import (
     ABSENT,
+    EXCLUDED_PARTS,
     TEMP_PREFIX,
     BackendError,
     ExecResult,
@@ -91,7 +92,6 @@ from nbgpu.backends.base import (
     UnsupportedError,
 )
 
-EXCLUDED_PARTS: frozenset[str] = frozenset({".git", ".venv", "__pycache__", "node_modules"})
 PYTHON_NAMES: frozenset[str] = frozenset({"python", "python3"})
 
 # Marks the backend's own helper commands so the idle watchdog can ignore

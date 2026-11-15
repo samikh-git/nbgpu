@@ -42,6 +42,7 @@ from pathlib import Path
 
 from nbgpu.backends.base import (
     ABSENT,
+    EXCLUDED_PARTS,
     BackendError,
     ExecResult,
     RemoteProcess,
@@ -50,7 +51,6 @@ from nbgpu.backends.base import (
 )
 from nbgpu.spec import ComputeSpec, NotebookSpec
 
-HASH_EXCLUDED_PARTS = frozenset({".git", ".venv", "__pycache__", "node_modules"})
 
 
 def fake_request(
@@ -223,7 +223,7 @@ class FakeBackend:
             if not abs_path.startswith(prefix):
                 continue
             rel = abs_path[len(prefix):]
-            if any(part in HASH_EXCLUDED_PARTS for part in rel.split("/")):
+            if any(part in EXCLUDED_PARTS for part in rel.split("/")):
                 continue
             out[rel] = hashlib.sha256(data).hexdigest()
         hooks, self._after_hash = self._after_hash, []

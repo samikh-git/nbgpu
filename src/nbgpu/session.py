@@ -13,6 +13,7 @@ import json
 import os
 import re
 import secrets
+import stat
 import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -44,6 +45,21 @@ def default_state_dir() -> Path:
     if xdg and Path(xdg).is_absolute():
         return Path(xdg) / "nbgpu"
     return Path.home() / ".local" / "state" / "nbgpu"
+
+
+def ensure_private_dir(directory: Path) -> None:
+    """Make sure `directory` exists and only the user can use it: created
+    0700, and an existing one we own has group/other permissions removed."""
+    directory = Path(directory)
+    directory.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        directory.mkdir(mode=_DIR_MODE)
+    except FileExistsError:
+        st = directory.stat()
+        if st.st_uid == os.getuid() and stat.S_IMODE(st.st_mode) & 0o077:
+            directory.chmod(stat.S_IMODE(st.st_mode) & _DIR_MODE)
+        return
+    directory.chmod(_DIR_MODE)  # mkdir's mode is filtered by the umask
 
 
 def new_session_id() -> str:
@@ -149,7 +165,7 @@ class SessionStore:
 
     def __init__(self, directory: Path | None = None) -> None:
         """Use `directory`, or default_state_dir() when None. Created lazily
-        with mode 0700 on first write."""
+        with mode 0700 on first write (see ensure_private_dir)."""
         base = default_state_dir() if directory is None else Path(directory)
         self.directory = base.expanduser().resolve()
 
@@ -158,20 +174,10 @@ class SessionStore:
             raise ValueError(f"invalid session id {session_id!r}")
         return self.directory / f"{session_id}{_RECORD_SUFFIX}"
 
-    def _ensure_directory(self) -> None:
-        self.directory.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            self.directory.mkdir(mode=_DIR_MODE)
-        except FileExistsError:
-            return
-        # mkdir's mode is filtered by the umask; set it exactly. A directory
-        # that already existed is left as the user made it.
-        os.chmod(self.directory, _DIR_MODE)
-
     def save(self, session: Session) -> None:
         """Write atomically (temp file + rename), file mode 0600."""
         target = self._path(session.session_id)
-        self._ensure_directory()
+        ensure_private_dir(self.directory)
         data = json.dumps(_to_record(session), indent=2, sort_keys=True) + "\n"
         # mkstemp creates the file 0600; the leading dot and .tmp suffix keep
         # it out of list() while it is being written.

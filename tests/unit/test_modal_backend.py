@@ -448,7 +448,8 @@ def test_write_file_removes_temp_when_upload_fails(tmp_path: Path, monkeypatch: 
 
 def test_hash_one_liner(tmp_path: Path) -> None:
     files = {"x.txt": b"x", "d/e/y.bin": bytes(range(256)), ".hidden/k": b"", "a.git.txt": b"kept"}
-    excluded = {".git/HEAD": b"r", "d/__pycache__/q.pyc": b"\0", "node_modules/i.js": b"", ".venv/s.py": b""}
+    excluded = {".git/HEAD": b"r", "d/__pycache__/q.pyc": b"\0", "node_modules/i.js": b"", ".venv/s.py": b"",
+                "__marimo__/session/nb.json": b"{}", ".nbgpu/x": b""}
     for rel, data in {**files, **excluded}.items():
         p = tmp_path / rel
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -701,7 +702,7 @@ def test_create_cleanup_ignores_signals_and_restores_them(monkeypatch: pytest.Mo
 
     def terminate(handle: object) -> None:
         during.update(
-            id=getattr(handle, "runtime_id"),
+            id=handle.runtime_id,  # type: ignore[attr-defined]
             **{name: signal.getsignal(getattr(signal, name)) for name in ("SIGINT", "SIGTERM", "SIGHUP")},
         )
         raise BackendError("terminate failed")  # swallowed: the original error wins

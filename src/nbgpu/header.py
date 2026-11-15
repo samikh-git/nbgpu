@@ -16,14 +16,12 @@ import re
 import tomllib
 from collections.abc import Sequence
 
-_BLOCK_RE = re.compile(r"(?m)^# /// script$\s(?P<content>(^#(| .*)$\s)+)^# ///$")
+from nbgpu.spec import block_toml, requirement_name, script_block
+
+__all__ = ["requirement_name", "update_dependencies"]
+
 _DEPS_START = re.compile(r"(?m)^# dependencies\s*=")
 _ONE_LINE_MAX = 88
-
-
-def requirement_name(requirement: str) -> str:
-    match = re.match(r"\s*([A-Za-z0-9][A-Za-z0-9._-]*)", requirement)
-    return re.sub(r"[-_.]+", "-", match.group(1)).lower() if match else requirement.strip().lower()
 
 
 def _format(deps: Sequence[str]) -> str:
@@ -61,17 +59,13 @@ def _deps_span(block_text: str, start: int) -> int:
 def update_dependencies(text: str, add: Sequence[str] = (), remove: Sequence[str] = ()) -> tuple[str, list[str]]:
     """Return (new text, the dependencies after the change). Raises
     ValueError if the header cannot be parsed (the file is then left alone)."""
-    match = _BLOCK_RE.search(text)
+    match = script_block(text)  # SpecError (a ValueError) for several blocks
     if match is None:
         deps = _merge([], add, remove)
         header = "# /// script\n" + _format(deps) + "# ///\n"
         return (header + "\n" + text, deps) if deps else (text, deps)
-    content = "".join(
-        line[2:] if line.startswith("# ") else line[1:]
-        for line in match.group("content").splitlines(keepends=True)
-    )
     try:
-        meta = tomllib.loads(content)
+        meta = tomllib.loads(block_toml(match))
     except tomllib.TOMLDecodeError as exc:
         raise ValueError(f"invalid TOML in the script header: {exc}") from exc
     current = meta.get("dependencies", [])

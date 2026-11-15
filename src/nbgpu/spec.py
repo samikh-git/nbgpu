@@ -104,25 +104,41 @@ _MEMORY_UNITS_BYTES = {
 }
 
 
-def read_script_metadata(text: str) -> dict | None:
-    """Return the parsed TOML of the `# /// script` block, or None if absent.
+def requirement_name(requirement: str) -> str:
+    """The normalized distribution name of a requirement string (PEP 503):
+    "Torch_Vision[cuda]>=0.1" -> "torch-vision"."""
+    match = re.match(r"\s*([A-Za-z0-9][A-Za-z0-9._-]*)", requirement)
+    return re.sub(r"[-_.]+", "-", match.group(1)).lower() if match else requirement.strip().lower()
 
-    Follows the PEP 723 reference regex: the block starts with a line that is
-    exactly `# /// script`, ends with a line that is exactly `# ///`, and every
-    line in between starts with `#` (content after `# ` or a bare `#`).
-    Raises SpecError if more than one script block exists or the TOML is invalid.
-    """
+
+def script_block(text: str) -> re.Match[str] | None:
+    """The `# /// script` block (its "content" group is the commented TOML),
+    or None if absent. Follows the PEP 723 reference regex: the block starts
+    with a line that is exactly `# /// script`, ends with a line that is
+    exactly `# ///`, and every line in between starts with `#`. Raises
+    SpecError if there is more than one."""
     blocks = [m for m in _BLOCK_RE.finditer(text) if m.group("type") == "script"]
-    if not blocks:
-        return None
     if len(blocks) > 1:
         raise SpecError("more than one `# /// script` block")
-    content = "".join(
+    return blocks[0] if blocks else None
+
+
+def block_toml(block: re.Match[str]) -> str:
+    """The TOML text of a script block: each line without its `# ` or `#`."""
+    return "".join(
         line[2:] if line.startswith("# ") else line[1:]
-        for line in blocks[0].group("content").splitlines(keepends=True)
+        for line in block.group("content").splitlines(keepends=True)
     )
+
+
+def read_script_metadata(text: str) -> dict | None:
+    """Return the parsed TOML of the `# /// script` block, or None if absent.
+    Raises SpecError if more than one script block exists or the TOML is invalid."""
+    block = script_block(text)
+    if block is None:
+        return None
     try:
-        return tomllib.loads(content)
+        return tomllib.loads(block_toml(block))
     except tomllib.TOMLDecodeError as exc:
         raise SpecError(f"invalid TOML in `# /// script` block: {exc}") from exc
 

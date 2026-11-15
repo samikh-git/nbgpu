@@ -151,12 +151,9 @@ from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from nbgpu.backends.base import ABSENT, TEMP_PREFIX, Backend, RuntimeHandle
+from nbgpu.backends.base import ABSENT, EXCLUDED_PARTS, TEMP_PREFIX, Backend, RuntimeHandle
 from nbgpu.ignore import IgnoreRules
 
-EXCLUDED_PARTS = frozenset(
-    {".git", ".venv", "__pycache__", "node_modules", ".nbgpu", "__marimo__"}
-)
 PULL_SUFFIXES = frozenset({".py", ".md", ".toml", ".txt", ".json", ".yaml", ".yml", ".cfg", ".ini"})
 PULL_MAX_BYTES = 1024 * 1024
 PUSH_MAX_BYTES = 50 * 1024 * 1024  # larger local files are skipped with a warning

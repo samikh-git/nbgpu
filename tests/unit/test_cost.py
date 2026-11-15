@@ -3,9 +3,29 @@ the contents of DEFAULT_PRICES, except the DEFAULT_PRICES section at the end."""
 
 from __future__ import annotations
 
+import datetime as dt
+
 import pytest
 
-from nbgpu.cost import PriceTable, Rate, cost_so_far, format_usd, hourly_rate, normalise_gpu
+from nbgpu.backends.base import ProviderPrices
+from nbgpu.cost import (
+    KIND_FILE,
+    KIND_LIST,
+    KIND_LIVE,
+    LIVE_MAX_AGE_S,
+    PRICES_ENV,
+    PriceTable,
+    Rate,
+    cost_so_far,
+    current_prices,
+    disclaimer,
+    format_usd,
+    hourly_rate,
+    is_stale,
+    normalise_gpu,
+    parse_prices,
+    save_live_prices,
+)
 from nbgpu.spec import ComputeSpec
 
 PRICES = PriceTable(
@@ -293,9 +313,6 @@ def test_default_prices_give_complete_rate_for_typical_modal_shape() -> None:
 # price files: parse_prices, $NBGPU_PRICES, staleness
 # --------------------------------------------------------------------------
 
-import datetime as dt  # noqa: E402
-
-from nbgpu.cost import PRICES_ENV, current_prices, disclaimer, is_stale, parse_prices  # noqa: E402
 
 _PRICE_FILE = """
 checked = "2026-03-01"
@@ -381,9 +398,6 @@ def test_disclaimer_names_the_date_and_flags_stale_tables() -> None:
 # --------------------------------------------------------------------------
 # live prices
 # --------------------------------------------------------------------------
-
-from nbgpu.backends.base import ProviderPrices  # noqa: E402
-from nbgpu.cost import KIND_FILE, KIND_LIST, KIND_LIVE, LIVE_MAX_AGE_S, save_live_prices  # noqa: E402
 
 
 def test_live_prices_override_the_shipped_ones_they_cover(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:

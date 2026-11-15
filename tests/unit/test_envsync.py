@@ -191,7 +191,7 @@ def test_a_resumed_loop_applies_edits_made_while_it_was_off(env, tmp_path: Path)
 
 
 def test_stop_lists_installs_the_notebook_does_not_name(tmp_path: Path, monkeypatch) -> None:
-    from nbgpu import envsync, lifecycle
+    from nbgpu import envsync
 
     nb = tmp_path / "nb.py"
     nb.write_text(header(["marimo", "emoji"]))

@@ -42,7 +42,6 @@ import collections
 import fcntl
 import json
 import os
-import re
 import threading
 import time
 from collections.abc import Mapping
@@ -51,7 +50,7 @@ from pathlib import Path
 
 from nbgpu.backends.base import CAP_LIVE_INSTALL, Backend, RemoteProcess, RuntimeHandle
 from nbgpu.session import Session, SessionStore
-from nbgpu.spec import NotebookSpec, SpecError, load_spec
+from nbgpu.spec import NotebookSpec, SpecError, load_spec, requirement_name
 
 EXTRA_ENV = "env"
 # --system: the runtime's Python is not a virtualenv (it is the image's
@@ -109,11 +108,6 @@ class Applied:
     failed: bool = False
 
 
-def _name(requirement: str) -> str:
-    match = re.match(r"\s*([A-Za-z0-9][A-Za-z0-9._-]*)", requirement)
-    return re.sub(r"[-_.]+", "-", match.group(1)).lower() if match else requirement.strip().lower()
-
-
 PACKAGES_BASELINE_NAME = "nbgpu-packages-at-start.json"
 
 # argv[1]: the baseline file. Without argv[2] ("diff"): write the names of
@@ -167,8 +161,8 @@ def unrecorded_installs(backend: Backend, handle: RuntimeHandle, baseline: str, 
         return None
     if not isinstance(found, list):
         return None
-    named = {_name(d) for d in spec.dependencies}
-    return [p for p in found if isinstance(p, str) and _name(p) not in named]
+    named = {requirement_name(d) for d in spec.dependencies}
+    return [p for p in found if isinstance(p, str) and requirement_name(p) not in named]
 
 
 def snapshot(spec: NotebookSpec) -> dict[str, object]:
@@ -201,6 +195,8 @@ class EnvWatcher:
         self._backend = backend
         self._handle = handle
         self._store = store
+        # None: the first tick compares the notebook with what was applied, so
+        # a loop resumed by `nbgpu open` catches edits made while it was off.
         self._fingerprint: tuple | None = None
         self._install: _Install | None = None
         self._reported: set[str] = set()  # one-off notes already shown
@@ -219,9 +215,6 @@ class EnvWatcher:
             except SpecError:
                 applied = {"deps": [], "compute": {}}
         self._applied: dict = applied
-        # None: the first tick compares the notebook with what was applied, so
-        # a loop resumed by `nbgpu open` catches edits made while it was off.
-        self._fingerprint = None
 
     @property
     def installing(self) -> bool:
@@ -346,8 +339,8 @@ class EnvWatcher:
                     messages,
                 )
 
-        new_names = {_name(d) for d in new_deps}
-        removed = [d for d in old_deps if _name(d) not in new_names]
+        new_names = {requirement_name(d) for d in new_deps}
+        removed = [d for d in old_deps if requirement_name(d) not in new_names]
         if removed:
             self._note_once(
                 "removed:" + ",".join(sorted(removed)),
@@ -441,15 +434,6 @@ class EnvWatcher:
         except SpecError:
             return
         self._save_applied()
-
-    def stop(self) -> None:
-        if self._install is not None:
-            try:
-                self._install.proc.terminate()
-            except Exception:  # noqa: BLE001
-                pass
-            self._install = None
-        self._lock.release()
 
 
 def applied_extra(spec: NotebookSpec) -> Mapping[str, str]:
