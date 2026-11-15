@@ -419,3 +419,37 @@ def test_a_running_cell_keeps_the_session_alive(tmp_path: Path, fake_marimo) -> 
             wd.kill()
             wd.wait()
         server.close()
+
+
+def test_ignored_outputs_written_by_the_notebook_are_not_unsynced(tmp_path: Path) -> None:
+    """End to end with the real sync engine and local backend: a gitignored
+    output the notebook writes in the runtime never counts as an unsynced
+    edit (it is not pulled, so waiting for it would only keep billing)."""
+    import posixpath
+
+    from nbgpu.backends.base import RuntimeRequest
+    from nbgpu.backends.local import LocalBackend
+    from nbgpu.spec import ComputeSpec, NotebookSpec
+    from nbgpu.sync import SyncEngine
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".gitignore").write_text("out/\n")
+    (project / "nb.py").write_text("print(1)\n")
+    backend = LocalBackend(base_dir=tmp_path / "runtimes")
+    spec = NotebookSpec(path=project / "nb.py", requires_python=None, dependencies=(),
+                        compute=ComputeSpec(provider="local"))
+    handle = backend.create(RuntimeRequest(spec=spec, tags={}))
+    try:
+        manifest = posixpath.join(posixpath.dirname(handle.remote_root), "nbgpu-synced.json")
+        engine = SyncEngine(project, backend, handle, tmp_path / "state.json", manifest_path=manifest)
+        engine.initial_push()
+        backend.write_file(handle, "out/metrics.json", b"{}")
+        backend.write_file(handle, "nb.py", b"print(2)\n")  # a real browser edit, not yet pulled
+        assert watchdog.unsynced_paths(handle.remote_root, watchdog.read_manifest(manifest),
+                                       watchdog.HashCache()) == ["nb.py", "out/metrics.json"]
+        engine.poll_once()
+        assert watchdog.unsynced_paths(handle.remote_root, watchdog.read_manifest(manifest),
+                                       watchdog.HashCache()) == []
+    finally:
+        backend.terminate(handle)

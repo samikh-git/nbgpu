@@ -1719,3 +1719,39 @@ def test_flush_writes_a_queued_manifest(env: Env, clock) -> None:
     engine.flush_manifest()
     assert "notebook.py" in _manifest(env)["files"]  # type: ignore[index,operator]
     assert engine.flush_manifest() is None
+
+
+def test_manifest_lists_ignored_remote_files_so_the_watchdog_does_not_wait(env: Env, clock: _Clock) -> None:
+    """A notebook output under a gitignored directory is neither pulled nor
+    an unsynced edit: the manifest lists it by its current hash, and stops
+    listing it once it is gone."""
+    env.write_local(".gitignore", "out/\n")
+    env.write_local("notebook.py", NOTEBOOK)
+    _menv(env).initial_push()
+    env.remote_write("out/metrics.json", "{}")
+
+    report = _menv(env).poll_once()
+
+    assert report.pulled == [] and not (env.root / "out").exists()
+    files = _manifest(env)["files"]  # type: ignore[index]
+    assert files["out/metrics.json"] == _sha("{}")  # type: ignore[index]
+
+    # The output changes: the manifest follows it.
+    env.remote_write("out/metrics.json", '{"loss": 1}')
+    _menv(env).poll_once()
+    assert _manifest(env)["files"]["out/metrics.json"] == _sha('{"loss": 1}')  # type: ignore[index]
+
+    # Kept across operations that do not hash the remote (flush after the loop).
+    engine = SyncEngine(env.root, env.backend, env.handle, env.state_path, manifest_path=MANIFEST,
+                        defer_manifest=True)
+    clock.t += 1
+    env.remote_write("out/more.json", "[]")
+    engine.poll_once()
+    engine.poll_once()
+    engine.flush_manifest()
+    assert {"out/metrics.json", "out/more.json"} <= set(_manifest(env)["files"])  # type: ignore[arg-type]
+
+    # Deleted remotely: dropped from the manifest.
+    env.backend.remote_delete(env.handle, "out/more.json")
+    _menv(env).poll_once()
+    assert "out/more.json" not in _manifest(env)["files"]  # type: ignore[operator]

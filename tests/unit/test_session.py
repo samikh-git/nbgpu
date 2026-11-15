@@ -358,6 +358,21 @@ class TestStoreList:
         bad.write_text(content)
         assert store.list() == [good]
 
+    def test_list_never_opens_other_json_files(
+        self, store: SessionStore, store_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import nbgpu.session as session_mod
+
+        good = make_session("11111111")
+        store.save(good)
+        (store_dir / "11111111.sync.json").write_text("{}")  # sync state: can be many MB
+        (store_dir / "settings.v2.json").write_text("{}")
+        opened: list[str] = []
+        real = session_mod._read_record
+        monkeypatch.setattr(session_mod, "_read_record", lambda p: opened.append(p.name) or real(p))
+        assert store.list() == [good]
+        assert opened == ["11111111.json"]
+
     def test_list_skips_unreadable_file(self, store: SessionStore, store_dir: Path) -> None:
 
         good = make_session("11111111")

@@ -199,12 +199,13 @@ class SessionStore:
 
     def list(self) -> list[Session]:
         """All records, oldest first. Unreadable or corrupt files are skipped,
-        not fatal."""
+        not fatal. Other files in the directory (e.g. `<id>.sync.json`, which
+        can be large) are never opened."""
         try:
             paths = [
                 p
                 for p in self.directory.iterdir()
-                if p.suffix == _RECORD_SUFFIX and not p.name.startswith(".")
+                if p.suffix == _RECORD_SUFFIX and _SESSION_ID_RE.fullmatch(p.stem)
             ]
         except FileNotFoundError:
             return []
