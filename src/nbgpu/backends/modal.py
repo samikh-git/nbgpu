@@ -66,6 +66,7 @@ Implementation notes (checked against modal 1.6.4):
 
 from __future__ import annotations
 
+import base64
 import io
 import json
 import math
@@ -77,6 +78,7 @@ import tarfile
 import threading
 import time
 import uuid
+import zlib
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from typing import TYPE_CHECKING, Any
@@ -84,6 +86,7 @@ from typing import TYPE_CHECKING, Any
 from nbgpu.backends.base import (
     ABSENT,
     CAP_GPU,
+    CAP_LIVE_INSTALL,
     CAP_MAX_RUNTIME,
     CAP_VOLUMES,
     TEMP_PREFIX,
@@ -136,7 +139,8 @@ MAX_RUNTIME_LIMIT_S = 24 * 60 * 60
 # enforced by the in-runtime watchdog, not by this (see the module docstring).
 IDLE_GRACE_S = 300
 
-BASE_PACKAGES: tuple[str, ...] = ("marimo", "watchdog")
+# uv installs packages into the running sandbox (nbgpu and marimo use it).
+BASE_PACKAGES: tuple[str, ...] = ("marimo", "watchdog", "uv")
 
 INTERNAL_TAG_PREFIX = "nbgpu.internal."
 TAG_CREATED_AT = INTERNAL_TAG_PREFIX + "created_at"
@@ -445,9 +449,31 @@ def _requirement_name(requirement: str) -> str:
     return re.sub(r"[-_.]+", "-", match.group(1)).lower()
 
 
-def image_packages(dependencies: Sequence[str]) -> list[str]:
+def local_marimo_version() -> str | None:
+    """The marimo version installed next to nbgpu, or None."""
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+    except ImportError:  # pragma: no cover
+        return None
+    try:
+        return version("marimo")
+    except PackageNotFoundError:
+        return None
+
+
+def _pin_marimo(requirement: str, marimo_version: str | None) -> str:
+    """A bare `marimo` (optionally with extras) becomes `marimo==<version>`,
+    so the runtime matches the laptop (whose copy serves the frontend); a
+    requirement with a version specifier or marker is the user's choice."""
+    if marimo_version is None or not re.fullmatch(r"\s*[Mm]arimo\s*(\[[^\]]*\])?\s*", requirement):
+        return requirement
+    return f"{requirement.strip()}=={marimo_version}"
+
+
+def image_packages(dependencies: Sequence[str], marimo_version: str | None = None) -> list[str]:
     """The spec's dependencies (in order, exact duplicates removed) plus
-    marimo and watchdog unless a dependency already names them."""
+    marimo and watchdog unless a dependency already names them. With
+    `marimo_version`, an unversioned marimo (given or added) is pinned to it."""
     out: list[str] = []
     seen_reqs: set[str] = set()
     names: set[str] = set()
@@ -457,10 +483,10 @@ def image_packages(dependencies: Sequence[str]) -> list[str]:
             continue
         seen_reqs.add(dep)
         names.add(_requirement_name(dep))
-        out.append(dep)
+        out.append(_pin_marimo(dep, marimo_version))
     for base in BASE_PACKAGES:
         if base not in names:
-            out.append(base)
+            out.append(_pin_marimo(base, marimo_version))
     return out
 
 
@@ -618,7 +644,7 @@ def validate_spec(spec: NotebookSpec) -> dict[str, Any]:
     return {
         "gpu": gpu,
         "python_version": choose_python_version(spec.requires_python),
-        "packages": image_packages(spec.dependencies),
+        "packages": image_packages(spec.dependencies, local_marimo_version()),
     }
 
 
@@ -683,8 +709,40 @@ def hash_cache_path(remote_root: str) -> str:
     return posixpath.join(posixpath.dirname(posixpath.normpath(remote_root)), HASH_CACHE_NAME)
 
 
-def hash_argv(root: str, cache_path: str) -> list[str]:
-    return [REMOTE_PYTHON, "-c", HASH_CODE, root, TEMP_PREFIX, cache_path, *HASH_EXCLUDED_PARTS]
+# Run before HASH_CODE when argv starts with `--write-first PATH N chunk...`:
+# writes zlib(base64) of the N chunks to PATH atomically (best effort), then
+# drops those arguments so HASH_CODE sees its usual argv.
+WRITE_FIRST_CODE = (
+    "import base64 as _b, os as _o, sys as _s, zlib as _z\n"
+    "if len(_s.argv) > 3 and _s.argv[1] == '--write-first':\n"
+    "    _dest, _n = _s.argv[2], int(_s.argv[3])\n"
+    "    _tmp = _o.path.join(_o.path.dirname(_dest), %r + 'w' + str(_o.getpid()))\n"
+    "    try:\n"
+    "        with open(_tmp, 'wb') as _f:\n"
+    "            _f.write(_z.decompress(_b.b64decode(''.join(_s.argv[4:4 + _n]))))\n"
+    "        _o.replace(_tmp, _dest)\n"
+    "    except Exception as _e:\n"
+    "        print('nbgpu: write-first failed: %%s' %% _e, file=_s.stderr)\n"
+    "        try:\n"
+    "            _o.unlink(_tmp)\n"
+    "        except OSError:\n"
+    "            pass\n"
+    "    _s.argv = _s.argv[:1] + _s.argv[4 + _n:]\n"
+) % TEMP_PREFIX
+# Linux limits one argument to 128 KiB; stay well under it.
+ARG_CHUNK = 100_000
+
+
+def write_first_args(path: str, data: bytes) -> list[str]:
+    encoded = base64.b64encode(zlib.compress(data, 6)).decode("ascii")
+    chunks = [encoded[i : i + ARG_CHUNK] for i in range(0, len(encoded), ARG_CHUNK)] or [""]
+    return ["--write-first", path, str(len(chunks)), *chunks]
+
+
+def hash_argv(root: str, cache_path: str, write_first: tuple[str, bytes] | None = None) -> list[str]:
+    pre = write_first_args(*write_first) if write_first is not None else []
+    return [REMOTE_PYTHON, "-c", WRITE_FIRST_CODE + HASH_CODE, *pre, root, TEMP_PREFIX, cache_path,
+            *HASH_EXCLUDED_PARTS]
 
 
 def launch_argv(pidfile: str, argv: Sequence[str]) -> list[str]:
@@ -787,7 +845,7 @@ class _ModalProcess:
 class ModalBackend:
     name = "modal"
     bind_host = "0.0.0.0"
-    capabilities: frozenset[str] = frozenset({CAP_GPU, CAP_VOLUMES, CAP_MAX_RUNTIME})
+    capabilities: frozenset[str] = frozenset({CAP_GPU, CAP_VOLUMES, CAP_MAX_RUNTIME, CAP_LIVE_INSTALL})
 
     def __init__(self, app_name: str = "nbgpu") -> None:
         self.app_name = app_name
@@ -1096,9 +1154,13 @@ class ModalBackend:
             raise BackendError(f"Modal: unpacking the project failed: {res.stderr.strip()}")
         return parse_bulk_output(res.stdout, files)
 
-    def hash_files(self, handle: RuntimeHandle, root: str = ".") -> dict[str, str]:
+    def hash_files(
+        self, handle: RuntimeHandle, root: str = ".", *, write_first: tuple[str, bytes] | None = None
+    ) -> dict[str, str]:
         target = resolve_path(handle.remote_root, root)
-        argv = hash_argv(target, hash_cache_path(handle.remote_root))
+        if write_first is not None:
+            write_first = (resolve_path(handle.remote_root, write_first[0]), write_first[1])
+        argv = hash_argv(target, hash_cache_path(handle.remote_root), write_first)
         res = self.exec(handle, argv, cwd="/", env=INTERNAL_ENV, timeout_s=600)
         if res.exit_code != 0:
             raise BackendError(f"Modal: hashing files under {target} failed: {res.stderr.strip()}")

@@ -241,3 +241,27 @@ def test_modal_bulk_code_is_create_only_and_safe(tmp_path: Path) -> None:
     assert not (tmp_path / "outside" / "escape.txt").exists()
     assert not archive.exists()
     assert not [p for p in root.rglob("*") if p.name.startswith(".nbgpu-tmp-")]
+
+
+def test_modal_hash_code_writes_first_in_chunks(tmp_path: Path) -> None:
+    import json
+    import os
+
+    from nbgpu.backends import modal as mb
+
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "a.py").write_text("print(1)\n")
+    manifest = tmp_path / "manifest.json"
+    payload = json.dumps({"files": {f"dir/file{i}.py": os.urandom(32).hex() for i in range(6000)}}).encode()
+    argv = mb.hash_argv(str(root), str(tmp_path / "cache.json"), (str(manifest), payload))
+    assert int(argv[argv.index("--write-first") + 2]) > 1  # needed several chunks
+    assert max(len(a) for a in argv[3:]) <= mb.ARG_CHUNK
+    res = subprocess.run([sys.executable, *argv[1:]], capture_output=True, text=True, check=True)
+    assert json.loads(res.stdout) == {"a.py": __import__("hashlib").sha256(b"print(1)\n").hexdigest()}
+    assert manifest.read_bytes() == payload
+    assert not [p for p in tmp_path.iterdir() if p.name.startswith(".nbgpu-tmp-")]
+    # no write-first: the usual argv still works
+    res = subprocess.run([sys.executable, *mb.hash_argv(str(root), str(tmp_path / "cache.json"))[1:]],
+                         capture_output=True, text=True, check=True)
+    assert "a.py" in json.loads(res.stdout)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -348,3 +349,36 @@ def test_the_sync_loop_restarts_a_dead_watchdog(fast_watchdog, project: Path, no
     finally:
         for handle in backend.find({}):
             backend.terminate(handle)
+
+
+def test_cli_start_serves_a_local_proxy_and_exits_cleanly_after_an_external_stop(project: Path, cli_backend) -> None:
+    """`start` (not detached) prints a localhost link whose assets come from
+    the local marimo; `nbgpu stop` elsewhere ends the loop without an error."""
+    from tests.e2e.conftest import http_get
+
+    proc = popen_nbgpu("start", "notebook.py", "--backend", "local", "--json", cwd=project)
+    try:
+        assert proc.stdout is not None
+        lines: list[str] = []
+        while not (lines and lines[-1].startswith("}")):
+            line = proc.stdout.readline()
+            assert line, f"start ended early: {proc.stderr.read() if proc.stderr else ''}"
+            lines.append(line)
+        started = json.loads("".join(lines))
+        local = started["local_url"]
+        assert local and local.startswith("http://127.0.0.1:") and "access_token=" in local
+        page = http_get(local, follow_redirects=True)
+        assert page.status == 200 and b"data-version" in page.body
+        asset = re.search(rb'(?:src|href)="\./(assets/[^"]+\.js)"', page.body)
+        assert asset, "the page references its assets"
+        base = local.split("/?", 1)[0]
+        served = http_get(f"{base}/{asset.group(1).decode()}")
+        assert served.status == 200 and "immutable" in served.headers.get("cache-control", "")
+
+        assert nbgpu("stop", "notebook.py", cwd=project).returncode == 0
+        _, err = proc.communicate(timeout=60)
+        assert proc.returncode == 0, err
+        assert "was stopped" in err and "could not be recovered" not in err
+    finally:
+        if proc.poll() is None:
+            proc.kill()

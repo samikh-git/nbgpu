@@ -14,11 +14,17 @@ A notebook declares its compute next to its dependencies:
     # idle-timeout = "20m"
     # max-runtime = "8h"
     # volumes = { "/data" = "my-datasets" }
+    # exclude = ["data/", "*.ckpt"]
+    # requirements = "requirements.txt"
     # ///
 
 `exclude` lists gitignore-style patterns (relative to the project root) for
 files that should not be uploaded or pulled even though git tracks them;
 `.gitignore` files are always respected (see nbgpu.ignore).
+
+`requirements` names requirements files (a path or a list, relative to the
+notebook's directory) whose packages are installed with the header's
+`dependencies`. Only package lines (and `-r` includes) are supported.
 
 Every key under [tool.nbgpu] is optional. A notebook with no header, or a
 header with no [tool.nbgpu] table, gets the defaults below (a CPU-only
@@ -44,7 +50,7 @@ DEFAULT_IDLE_TIMEOUT_S = 20 * 60
 DEFAULT_MAX_RUNTIME_S = 8 * 60 * 60
 
 KNOWN_KEYS = frozenset(
-    {"provider", "gpu", "cpu", "memory", "idle-timeout", "max-runtime", "volumes", "exclude"}
+    {"provider", "gpu", "cpu", "memory", "idle-timeout", "max-runtime", "volumes", "exclude", "requirements"}
 )
 
 
@@ -74,6 +80,8 @@ class NotebookSpec:
     compute: ComputeSpec
     # gitignore-style patterns from [tool.nbgpu] exclude, relative to the project root
     exclude: tuple[str, ...] = ()
+    # requirements files read into `dependencies` (absolute paths)
+    requirement_files: tuple[Path, ...] = ()
 
 
 # The PEP 723 reference regex.
@@ -216,6 +224,40 @@ def _compute(table: Mapping[str, object]) -> ComputeSpec:
     return ComputeSpec(**kwargs)
 
 
+def parse_requirements_file(path: Path, _seen: frozenset[Path] = frozenset()) -> list[str]:
+    """Package lines of a requirements file, following `-r` includes.
+    Comments and blank lines are skipped; any other option (`-e`, `--index-url`,
+    ...) raises SpecError naming the file and line, rather than being ignored."""
+    path = Path(path).resolve()
+    if path in _seen:
+        raise SpecError(f"requirements: {path} includes itself")
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise SpecError(f"requirements: cannot read {str(path)!r}: {exc}") from exc
+    out: list[str] = []
+    for number, raw in enumerate(text.splitlines(), 1):
+        line = raw.split(" #", 1)[0].strip()
+        if not line or line.startswith("#"):
+            continue
+        include = re.fullmatch(r"(?:-r|--requirement)\s*=?\s*(\S+)", line)
+        if include:
+            out += parse_requirements_file(path.parent / include.group(1), _seen | {path})
+        elif line.startswith("-"):
+            raise SpecError(f"requirements: unsupported line {number} in {path.name}: {line!r} "
+                            "(only package requirements and -r includes are supported)")
+        else:
+            out.append(line)
+    return out
+
+
+def _requirement_files(value: object, base: Path) -> tuple[Path, ...]:
+    items = [value] if isinstance(value, str) else value
+    if not isinstance(items, list) or not items or not all(isinstance(p, str) and p.strip() for p in items):
+        raise SpecError(f"requirements must be a path or a list of paths, got {value!r}")
+    return tuple((base / p).resolve() for p in items)
+
+
 def _exclude(value: object) -> tuple[str, ...]:
     if not isinstance(value, list) or not all(isinstance(p, str) and p.strip() for p in value):
         raise SpecError(f"exclude must be a list of non-empty pattern strings, got {value!r}")
@@ -257,10 +299,15 @@ def load_spec(path: Path, overrides: Mapping[str, object] | None = None) -> Note
     given = {k: v for k, v in (overrides or {}).items() if v is not None}
     _check_keys(given, "in overrides")
 
+    merged = {**table, **given}
+    files = _requirement_files(merged["requirements"], path.parent) if "requirements" in merged else ()
+    for file in files:
+        dependencies = [*dependencies, *parse_requirements_file(file)]
     return NotebookSpec(
         path=path,
         requires_python=requires_python,
         dependencies=tuple(dependencies),
-        compute=_compute({k: v for k, v in {**table, **given}.items() if k != "exclude"}),
-        exclude=_exclude(merged["exclude"]) if "exclude" in (merged := {**table, **given}) else (),
+        compute=_compute({k: v for k, v in merged.items() if k not in ("exclude", "requirements")}),
+        exclude=_exclude(merged["exclude"]) if "exclude" in merged else (),
+        requirement_files=files,
     )

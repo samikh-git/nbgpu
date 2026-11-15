@@ -1679,3 +1679,43 @@ def test_manifest_write_failure_is_a_warning(env: Env, clock: _Clock, monkeypatc
 def test_manifest_path_must_be_absolute_and_outside_project(env: Env, path: str) -> None:
     with pytest.raises(ValueError, match="manifest_path"):
         SyncEngine(env.root, env.backend, env.handle, env.state_path, manifest_path=path)
+
+
+# --------------------------------------------------------------------------
+# deferred manifest (the sync loop's engine)
+
+
+def _denv(env: Env) -> SyncEngine:
+    return SyncEngine(env.root, env.backend, env.handle, env.state_path, manifest_path=MANIFEST, defer_manifest=True)
+
+
+def test_deferred_manifest_rides_on_the_next_hash(env: Env, clock) -> None:
+    env.write_local("notebook.py", NOTEBOOK)
+    _menv(env).initial_push()  # one-shot: written right away
+    first = _manifest(env)
+    assert first is not None and "notebook.py" in first["files"]  # type: ignore[operator]
+
+    engine = _denv(env)
+    env.write_local("helper.py", "x = 1\n")
+    writes_before = len(env.backend.writes)
+    engine.poll_once()  # pushes helper.py; the new manifest is only queued
+    assert env.backend.writes[writes_before:] == ["helper.py"]  # no separate manifest write
+    assert "helper.py" not in _manifest(env)["files"]  # type: ignore[index,operator]
+    hashes = env.backend.hash_calls
+    engine.poll_once()  # the next hash carries it
+    assert env.backend.hash_calls == hashes + 1
+    assert "helper.py" in _manifest(env)["files"]  # type: ignore[index,operator]
+    clock.t += 1
+    writes_before = len(env.backend.writes)
+    engine.poll_once()  # nothing changed: nothing queued or written
+    assert env.backend.writes[writes_before:] == [] and engine.flush_manifest() is None
+
+
+def test_flush_writes_a_queued_manifest(env: Env, clock) -> None:
+    env.write_local("notebook.py", NOTEBOOK)
+    engine = _denv(env)
+    engine.initial_push()
+    assert _manifest(env) is None  # queued, not written
+    engine.flush_manifest()
+    assert "notebook.py" in _manifest(env)["files"]  # type: ignore[index,operator]
+    assert engine.flush_manifest() is None

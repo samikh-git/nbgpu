@@ -5,7 +5,11 @@ description = "Run local marimo notebooks on remote GPUs"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "aiohttp>=3.9",
   "click>=8.1",
+  # The laptop serves marimo's frontend to the browser (nbgpu.proxy) and pins
+  # the runtime's marimo to the same version.
+  "marimo==0.25.2",
   "modal>=1.6",
   "pathspec>=0.12",
 ]
@@ -17,7 +21,6 @@ nbgpu = "nbgpu.cli:main"
 dev = [
   "pytest>=8",
   "pytest-timeout>=2.3",
-  "marimo==0.25.2",
 ]
 
 [build-system]

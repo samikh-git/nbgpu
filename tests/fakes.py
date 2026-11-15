@@ -208,8 +208,13 @@ class FakeBackend:
         files[abs_path] = bytes(data)
         return True
 
-    def hash_files(self, handle: RuntimeHandle, root: str = ".") -> dict[str, str]:
+    def hash_files(
+        self, handle: RuntimeHandle, root: str = ".", *, write_first: tuple[str, bytes] | None = None
+    ) -> dict[str, str]:
         files = self._require(handle)
+        if write_first is not None:
+            self.write_file(handle, write_first[0], write_first[1])
+            self.writes.pop()  # not a separate round trip
         self.hash_calls += 1
         abs_root = self._abs(handle, root)
         prefix = abs_root.rstrip("/") + "/"

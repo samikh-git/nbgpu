@@ -16,6 +16,7 @@ from nbgpu.backends import modal as mb
 from nbgpu.backends.base import (
     ABSENT,
     CAP_GPU,
+    CAP_LIVE_INSTALL,
     CAP_IDLE_TIMEOUT,
     CAP_MAX_RUNTIME,
     CAP_VOLUMES,
@@ -49,7 +50,7 @@ def test_init_does_not_contact_modal(monkeypatch: pytest.MonkeyPatch) -> None:
     assert backend.app_name == "nbgpu"
     assert backend.name == "modal"
     assert backend.bind_host == "0.0.0.0"
-    assert backend.capabilities == frozenset({CAP_GPU, CAP_VOLUMES, CAP_MAX_RUNTIME})
+    assert backend.capabilities == frozenset({CAP_GPU, CAP_VOLUMES, CAP_MAX_RUNTIME, CAP_LIVE_INSTALL})
     assert CAP_IDLE_TIMEOUT not in backend.capabilities
 
 
@@ -129,14 +130,22 @@ def test_unknown_gpu_message_lists_known() -> None:
 
 
 def test_image_packages_adds_marimo_and_watchdog() -> None:
-    assert mb.image_packages(()) == ["marimo", "watchdog"]
-    assert mb.image_packages(["torch", "numpy>=2"]) == ["torch", "numpy>=2", "marimo", "watchdog"]
+    assert mb.image_packages(()) == ["marimo", "watchdog", "uv"]
+    assert mb.image_packages(["torch", "numpy>=2"]) == ["torch", "numpy>=2", "marimo", "watchdog", "uv"]
+
+
+def test_image_packages_pins_an_unversioned_marimo() -> None:
+    assert mb.image_packages(["torch"], "0.25.2") == ["torch", "marimo==0.25.2", "watchdog", "uv"]
+    assert mb.image_packages(["marimo", "torch"], "0.25.2") == ["marimo==0.25.2", "torch", "watchdog", "uv"]
+    assert mb.image_packages(["marimo[sql]"], "0.25.2") == ["marimo[sql]==0.25.2", "watchdog", "uv"]
+    assert mb.image_packages(["marimo>=0.20"], "0.25.2") == ["marimo>=0.20", "watchdog", "uv"]  # the user's choice
+    assert mb.image_packages(["torch"], None) == ["torch", "marimo", "watchdog", "uv"]
 
 
 def test_image_packages_does_not_duplicate_marimo() -> None:
-    assert mb.image_packages(["marimo>=0.25", "torch"]) == ["marimo>=0.25", "torch", "watchdog"]
-    assert mb.image_packages(["Marimo[recommended]==0.25.2"]) == ["Marimo[recommended]==0.25.2", "watchdog"]
-    assert mb.image_packages(["watchdog", "marimo", "marimo"]) == ["watchdog", "marimo"]
+    assert mb.image_packages(["marimo>=0.25", "torch"]) == ["marimo>=0.25", "torch", "watchdog", "uv"]
+    assert mb.image_packages(["Marimo[recommended]==0.25.2"]) == ["Marimo[recommended]==0.25.2", "watchdog", "uv"]
+    assert mb.image_packages(["watchdog", "marimo", "marimo"]) == ["watchdog", "marimo", "uv"]
 
 
 @pytest.mark.parametrize(
@@ -167,7 +176,8 @@ def test_choose_python_version_unsatisfiable(requires: str) -> None:
 def test_validate_spec() -> None:
     settings = mb.validate_spec(_spec(gpu="a10g:2", dependencies=["torch"], requires_python=">=3.12"))
     assert settings["gpu"] == "A10G:2"
-    assert settings["packages"] == ["torch", "marimo", "watchdog"]
+    # marimo is pinned to the laptop's version, whose frontend the proxy serves
+    assert settings["packages"] == ["torch", f"marimo=={mb.local_marimo_version()}", "watchdog", "uv"]
     assert settings["python_version"] in mb.SUPPORTED_PYTHONS
     with pytest.raises(UnsupportedError):
         mb.validate_spec(_spec(max_runtime_s=25 * 3600))

@@ -671,8 +671,15 @@ class LocalBackend:
         except OSError as exc:
             raise BackendError(f"could not write {path}: {exc}") from exc
 
-    def hash_files(self, handle: RuntimeHandle, root: str = ".") -> dict[str, str]:
+    def hash_files(
+        self, handle: RuntimeHandle, root: str = ".", *, write_first: tuple[str, bytes] | None = None
+    ) -> dict[str, str]:
         base = self._resolve(handle, root)
+        if write_first is not None:
+            try:
+                self.write_file(handle, write_first[0], write_first[1])
+            except Exception:  # noqa: BLE001 - best effort, as the protocol says
+                pass
         return _hash_tree(str(base), self.hash_cache_path(handle))
 
     @staticmethod

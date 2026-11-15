@@ -25,6 +25,9 @@ CAP_GPU = "gpu"
 CAP_VOLUMES = "volumes"
 CAP_IDLE_TIMEOUT = "idle-timeout"  # backend enforces spec.compute.idle_timeout_s
 CAP_MAX_RUNTIME = "max-runtime"  # backend enforces spec.compute.max_runtime_s
+# Packages can be installed into the running runtime's own Python (an
+# isolated environment). The local backend lacks it: its Python is the user's.
+CAP_LIVE_INSTALL = "live-install"
 
 
 # Prefix for temporary files made by atomic writes, locally and remotely.
@@ -168,10 +171,17 @@ class Backend(Protocol):
         Returns True if written, False if the precondition failed."""
         ...
 
-    def hash_files(self, handle: RuntimeHandle, root: str = ".") -> dict[str, str]:
+    def hash_files(
+        self, handle: RuntimeHandle, root: str = ".", *, write_first: tuple[str, bytes] | None = None
+    ) -> dict[str, str]:
         """Every regular file under `root`: POSIX path relative to `root` ->
         SHA-256 hex. Paths whose parts include .git, .venv, __pycache__ or
-        node_modules are left out."""
+        node_modules are left out.
+
+        `write_first` = (absolute path outside `root`, bytes): written
+        atomically before hashing, in the same round trip (the sync loop sends
+        its manifest this way). Best effort: a failed write does not fail the
+        hash, and the file keeps its old content."""
         ...
 
     def terminate(self, handle: RuntimeHandle) -> None:

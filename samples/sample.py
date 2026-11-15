@@ -19,7 +19,7 @@ app = marimo.App()
 def _():
     import torch
     print(torch.cuda.is_available(), torch.cuda.get_device_name(0))
-    return
+    return (torch,)
 
 
 @app.cell
@@ -35,7 +35,8 @@ def _():
 
 
 @app.cell
-def _():
+def _(torch):
+    torch.cuda.is_available()
     return
 
 
@@ -50,6 +51,8 @@ def _():
 def _(mo):
     mo.md(r"""
     ## What is going on here?
+
+    $1 + 1$
     """)
     return
 

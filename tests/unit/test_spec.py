@@ -554,3 +554,37 @@ class TestLoadSpecOverrides:
         overrides = {"gpu": None, "cpu": None, "memory": None, "idle-timeout": None,
                      "max-runtime": None, "provider": None, "volumes": None}
         assert load_spec(path, overrides) == load_spec(path)
+
+
+# --------------------------------------------------------------------------
+# [tool.nbgpu] requirements
+
+
+def _nb_with_requirements(tmp_path, value: str):
+    nb = tmp_path / "nb.py"
+    nb.write_text(f'# /// script\n# dependencies = ["marimo"]\n# [tool.nbgpu]\n# requirements = {value}\n# ///\n')
+    return nb
+
+
+def test_requirements_files_are_read_into_dependencies(tmp_path) -> None:
+    (tmp_path / "base.txt").write_text("numpy>=2  # comment\n")
+    (tmp_path / "requirements.txt").write_text("# header\n-r base.txt\n\npolars\n")
+    (tmp_path / "dev.txt").write_text("pytest\n")
+    spec = load_spec(_nb_with_requirements(tmp_path, '["requirements.txt", "dev.txt"]'))
+    assert spec.dependencies == ("marimo", "numpy>=2", "polars", "pytest")
+    assert [p.name for p in spec.requirement_files] == ["requirements.txt", "dev.txt"]
+
+
+@pytest.mark.parametrize(
+    "content, match",
+    [("-e .\n", "unsupported line 1"), ("--index-url https://x\n", "unsupported"), ("-r requirements.txt\n", "itself")],
+)
+def test_requirements_files_reject_what_cannot_be_installed(tmp_path, content: str, match: str) -> None:
+    (tmp_path / "requirements.txt").write_text(content)
+    with pytest.raises(SpecError, match=match):
+        load_spec(_nb_with_requirements(tmp_path, '"requirements.txt"'))
+
+
+def test_missing_requirements_file_is_an_error(tmp_path) -> None:
+    with pytest.raises(SpecError, match="cannot read"):
+        load_spec(_nb_with_requirements(tmp_path, '"nope.txt"'))

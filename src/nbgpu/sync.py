@@ -120,6 +120,13 @@ unpulled. The manifest is rewritten only when its file list changes or at
 least every MANIFEST_REFRESH_S, so a quiet poll does no remote write. A
 failure to write it never fails the operation; it is reported in
 `SyncReport.warnings` and retried on the next operation.
+
+With `defer_manifest=True` (the long-lived engine of the sync loop) a due
+manifest is not written by itself: it is queued and sent with the next
+poll's `hash_files(write_first=...)`, saving a round trip on every change.
+It then lags by one tick, which is safe: a stale manifest can only list
+versions the laptop really had, so the watchdog may think files are
+unsynced (and wait) but never that unsynced files are synced.
 """
 
 from __future__ import annotations
@@ -547,6 +554,7 @@ class SyncEngine:
         *,
         manifest_path: str | None = None,
         exclude: Sequence[str] = (),
+        defer_manifest: bool = False,
     ) -> None:
         if manifest_path is not None:
             remote_root = handle.remote_root.rstrip("/") + "/"
@@ -561,6 +569,9 @@ class SyncEngine:
         self._state_path = Path(state_path)
         self._lock_path = self._state_path.with_name(self._state_path.name + ".lock")
         self._manifest_path = manifest_path
+        self._defer_manifest = defer_manifest
+        # A due manifest waiting for the next hash_files: (payload, digest, written_at).
+        self._pending_manifest: tuple[bytes, str, float] | None = None
         # A cache, valid only within one locked operation (reloaded by each).
         self._state = _State()
         self._saved: bytes | None = None
@@ -587,6 +598,18 @@ class SyncEngine:
         """A poll_once, used before stop or detach. Same rules: nothing is
         overwritten, conflicts are reported."""
         return self.poll_once()
+
+    def flush_manifest(self) -> SyncReport | None:
+        """Write a queued manifest now (when the loop stops, so the watchdog
+        does not keep a stale one). None if nothing was queued."""
+        if self._pending_manifest is None:
+            return None
+        self._pending_manifest = None
+        deferred, self._defer_manifest = self._defer_manifest, False
+        try:
+            return self._operation(lambda report: None)
+        finally:
+            self._defer_manifest = deferred
 
     @property
     def conflicts(self) -> list[str]:
@@ -742,6 +765,9 @@ class SyncEngine:
         if not due:
             return
         payload = json.dumps({"version": MANIFEST_VERSION, "written_at": now, "files": files}, indent=1)
+        if self._defer_manifest:
+            self._pending_manifest = (payload.encode("utf-8"), digest, now)
+            return
         try:
             ok = self._backend.write_file(self._handle, self._manifest_path, payload.encode("utf-8"), expect=None)
         except Exception as exc:  # noqa: BLE001 - the manifest must never fail a sync
@@ -811,7 +837,16 @@ class SyncEngine:
         """Remote syncable files -> hash. Unsafe paths are reported as skipped."""
         copies = self._state.copy_paths()
         remote: dict[str, str] = {}
-        for rel, digest in self._backend.hash_files(self._handle).items():
+        pending = self._pending_manifest if self._manifest_path is not None else None
+        if pending is not None:
+            hashed = self._backend.hash_files(self._handle, write_first=(self._manifest_path, pending[0]))
+            self._pending_manifest = None
+            state = self._state
+            state.manifest_path, state.manifest_digest, state.manifest_written_at = (
+                self._manifest_path, pending[1], pending[2])
+        else:
+            hashed = self._backend.hash_files(self._handle)
+        for rel, digest in hashed.items():
             if not is_safe_relpath(rel):
                 report.skip(rel)
             elif _syncable(rel) and rel not in copies and not self._ignore.is_ignored(rel):

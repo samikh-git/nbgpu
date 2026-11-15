@@ -91,7 +91,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from nbgpu import cost, sync, watchdog
-from nbgpu.backends.base import Backend, BackendError, RemoteProcess, RuntimeHandle, RuntimeRequest
+from nbgpu.backends.base import CAP_LIVE_INSTALL, Backend, BackendError, RemoteProcess, RuntimeHandle, RuntimeRequest
 from nbgpu.cost import Rate
 from nbgpu.session import (
     TAG_NOTEBOOK,
@@ -105,6 +105,8 @@ from nbgpu.session import (
     new_token,
     notebook_tag,
 )
+from nbgpu import envsync
+from nbgpu.envsync import applied_extra
 from nbgpu.ignore import IgnoreRules
 from nbgpu.spec import ComputeSpec, load_spec
 from nbgpu.sync import SyncEngine, SyncReport
@@ -695,12 +697,32 @@ def _wait_ready(proc: RemoteProcess, base_url: str, timeout_s: float) -> None:
     raise StartError(f"{problem}; last output:\n{output}")
 
 
+def _write_watchdog_script(backend: Backend, handle: RuntimeHandle) -> None:
+    script = importlib.resources.files("nbgpu").joinpath("watchdog.py").read_bytes()
+    backend.write_file(handle, runtime_path(handle, WATCHDOG_NAME), script)
+
+
 def _start_watchdog(
     backend: Backend, handle: RuntimeHandle, idle_timeout_s: float, unsynced_grace_s: float
 ) -> RemoteProcess:
-    script = importlib.resources.files("nbgpu").joinpath("watchdog.py").read_bytes()
+    _write_watchdog_script(backend, handle)
+    proc = _spawn_watchdog(backend, handle, idle_timeout_s, unsynced_grace_s)
+    time.sleep(_WATCHDOG_STARTUP_CHECK_S)
+    _check_watchdog(proc)
+    return proc
+
+
+def _check_watchdog(proc: RemoteProcess) -> None:
+    code = proc.poll()
+    if code is not None:
+        lines = _last_lines(proc, _START_ERROR_TAIL_LINES)
+        raise StartError(f"the idle watchdog exited with code {code}; last output:\n" + ("\n".join(lines) or "(no output)"))
+
+
+def _spawn_watchdog(
+    backend: Backend, handle: RuntimeHandle, idle_timeout_s: float, unsynced_grace_s: float
+) -> RemoteProcess:
     path = runtime_path(handle, WATCHDOG_NAME)
-    backend.write_file(handle, path, script)
     argv = [
         "python", path,
         "--project", handle.remote_root,
@@ -723,13 +745,7 @@ def _start_watchdog(
         # runs; only marimo's process tree is the session's there.
         "--scope", "tree" if backend.name == "local" else "all",
     ]
-    proc = backend.spawn(handle, argv, cwd=posixpath.dirname(handle.remote_root))
-    time.sleep(_WATCHDOG_STARTUP_CHECK_S)
-    code = proc.poll()
-    if code is not None:
-        lines = _last_lines(proc, _START_ERROR_TAIL_LINES)
-        raise StartError(f"the idle watchdog exited with code {code}; last output:\n" + ("\n".join(lines) or "(no output)"))
-    return proc
+    return backend.spawn(handle, argv, cwd=posixpath.dirname(handle.remote_root))
 
 
 def restart_watchdog(session: Session, backend: Backend, handle: RuntimeHandle) -> None:
@@ -789,13 +805,17 @@ def _engine(session: Session, backend: Backend, handle: RuntimeHandle, state_pat
     return _new_engine(session.project_root, backend, handle, state_path, session_exclude(session))
 
 
-def session_engine(session: Session, *, backend: Backend, store: SessionStore) -> SyncEngine:
-    """A SyncEngine for the session, to be kept and reused across polls.
+def session_engine(
+    session: Session, *, backend: Backend, store: SessionStore, defer_manifest: bool = False
+) -> SyncEngine:
+    """A SyncEngine for the session, to be kept and reused across polls
+    (`defer_manifest=True` for such a long-lived engine: see nbgpu.sync).
     Raises SessionNotRunning if the runtime is gone."""
     handle = _require_handle(session, backend)
     state_path = sync_state_path(session.session_id, store)
     _private_file(state_path)
-    return _engine(session, backend, handle, state_path)
+    return SyncEngine(session.project_root, backend, handle, state_path, manifest_path=manifest_path(handle),
+                      exclude=session_exclude(session), defer_manifest=defer_manifest)
 
 
 # ---------------------------------------------------------------------------
@@ -852,6 +872,7 @@ def _start(
         _EXTRA_IDLE_TIMEOUT: repr(idle_timeout_s),
         _EXTRA_UNSYNCED_GRACE: repr(grace_s),
         **({_EXTRA_EXCLUDE: json.dumps(list(spec.exclude))} if spec.exclude else {}),
+        **applied_extra(spec),
         **_rate_extra(rate_for(spec.compute)),
     }
     session = Session(
@@ -884,13 +905,26 @@ def _start(
         store.save(session)
 
         step(f"uploading {files} file{'s' if files != 1 else ''} ({_size_text(size)}) from {root.name}/")
-        _new_engine(root, backend, handle, state_path, spec.exclude).initial_push()
+        token = new_token()
+        token_file = token_path(handle)
+
+        def side_files() -> None:
+            # Independent of the upload, so it runs alongside it.
+            backend.write_file(handle, token_file, token.encode("utf-8"))
+            _write_watchdog_script(backend, handle)
+            if CAP_LIVE_INSTALL in backend.capabilities:
+                # What is installed now, so stop can tell what was added later.
+                with contextlib.suppress(Exception):
+                    backend.exec(handle, envsync.baseline_argv(runtime_path(handle, envsync.PACKAGES_BASELINE_NAME)),
+                                 cwd="/", timeout_s=60)
+
+        _in_parallel(
+            lambda: _new_engine(root, backend, handle, state_path, spec.exclude).initial_push(),
+            side_files,
+        )
         _private_file(state_path)
         note_synced(session, store)
 
-        token = new_token()
-        token_file = token_path(handle)
-        backend.write_file(handle, token_file, token.encode("utf-8"))
         pidfile = runtime_path(handle, MARIMO_PIDFILE_NAME)
         argv = _marimo_argv(
             notebook=rel_notebook,
@@ -900,9 +934,12 @@ def _start(
         )
         step("starting marimo")
         proc = backend.spawn(handle, _with_pidfile(pidfile, argv), cwd=handle.remote_root)
+        # The watchdog waits for marimo's pid file itself, so it starts now
+        # and is checked once marimo answers (no separate startup sleep).
+        dog = _spawn_watchdog(backend, handle, idle_timeout_s, grace_s)
         url = backend.expose(handle, MARIMO_PORT).rstrip("/")
         _wait_ready(proc, url, ready_timeout_s)
-        _start_watchdog(backend, handle, idle_timeout_s, grace_s)
+        _check_watchdog(dog)
 
         session.url = url
         session.token = token
@@ -936,6 +973,27 @@ def _size_text(size: int) -> str:
         if size >= scale:
             return f"{size / scale:.1f} {unit}"
     return f"{size} B"
+
+
+def _in_parallel(*calls: Callable[[], object]) -> None:
+    """Run the calls on threads and wait for all; re-raise the first error.
+    Each call talks to the backend (network-bound), so threads overlap well."""
+    errors: list[BaseException] = []
+
+    def run(call: Callable[[], object]) -> None:
+        try:
+            call()
+        except BaseException as exc:  # noqa: BLE001 - re-raised below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run, args=(c,), daemon=True) for c in calls[1:]]
+    for t in threads:
+        t.start()
+    run(calls[0])  # the first on this thread, so Ctrl-C still interrupts it
+    for t in threads:
+        t.join()
+    if errors:
+        raise errors[0]
 
 
 def _abandon_create(session: Session, backend: Backend, store: SessionStore, exc: BaseException) -> None:
@@ -1195,9 +1253,29 @@ def stop(
                 f"open sync conflicts: {listed}. Resolve them (delete the .remote copies) "
                 "or stop with --force to keep the local versions and the conflict copies"
             )
+        unrecorded = _unrecorded_installs(session, backend, handle)
         _terminate(backend, handle)
         _forget(session, store)
-        return _with_warnings(report)
+        notes = []
+        if unrecorded:
+            notes.append(
+                f"installed during the session but not in {session.notebook.name}'s dependencies: "
+                f"{', '.join(unrecorded)}; add them to its header (or a [tool.nbgpu] requirements file) "
+                "to have them next time"
+            )
+        return _with_warnings(report, *notes)
+
+
+def _unrecorded_installs(session: Session, backend: Backend, handle: RuntimeHandle) -> list[str]:
+    """Best effort (one exec): packages installed in the runtime that the
+    notebook does not list, e.g. installed from the remote link or by an agent."""
+    try:
+        spec = load_spec(session.notebook)
+        found = envsync.unrecorded_installs(
+            backend, handle, runtime_path(handle, envsync.PACKAGES_BASELINE_NAME), spec)
+    except Exception:  # noqa: BLE001 - never blocks a stop
+        return []
+    return found or []
 
 
 # ---------------------------------------------------------------------------

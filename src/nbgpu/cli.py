@@ -76,6 +76,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import sys
 import time
 from collections.abc import Mapping
@@ -88,6 +89,9 @@ from nbgpu import lifecycle
 from nbgpu.backends import get_backend
 from nbgpu.backends.base import Backend, RuntimeHandle
 from nbgpu.cost import Rate, format_usd
+from nbgpu.envsync import EnvWatcher
+from nbgpu.header import update_dependencies
+from nbgpu.proxy import LocalProxy
 from nbgpu.session import TAG_SESSION, Session, SessionStore
 from nbgpu.spec import load_spec
 from nbgpu.sync import SyncEngine, SyncReport
@@ -193,15 +197,43 @@ def _rate_text(rate: Rate | None) -> str:
     return _c(f"{format_usd(rate.usd_per_hour)}/h", "money")
 
 
-def _session_json(session: Session) -> dict[str, object]:
+def _session_json(session: Session, proxy: LocalProxy | None = None) -> dict[str, object]:
     return {
         "session_id": session.session_id,
         "notebook": str(session.notebook),
         "backend": session.backend,
         "runtime_id": session.runtime_id,
         "url": session.url_with_token(),
+        "local_url": proxy.url_with_token(session.token) if proxy is not None else None,
         "rate": _rate_json(lifecycle.session_rate(session)),
     }
+
+
+def _link(url: str) -> str:
+    """The URL as a clickable OSC 8 hyperlink when stdout is a terminal (the
+    visible text stays the plain URL, so terminals that detect URLs still do)."""
+    styled = _c(url, "url")
+    if not sys.stdout.isatty() or os.environ.get("NBGPU_NO_HYPERLINKS"):
+        return styled
+    return f"\x1b]8;;{url}\x1b\\{styled}\x1b]8;;\x1b\\"
+
+
+def _start_proxy(session: Session, *, quiet: bool, packages: queue.Queue | None = None) -> LocalProxy | None:
+    """A localhost proxy serving marimo's frontend from this machine; None
+    (with a warning) if it cannot start, in which case the remote URL works.
+    Package installs/removals made in marimo's UI are put on `packages`."""
+    if os.environ.get("NBGPU_NO_PROXY"):
+        return None
+    on_packages = (lambda added, removed: packages.put((added, removed))) if packages is not None else None
+    try:
+        proxy = LocalProxy(session.url, on_packages=on_packages)
+        proxy.start()
+    except Exception as exc:  # noqa: BLE001 - the direct URL still works
+        if not quiet:
+            _say(f"{_c('warning:', 'warn')} local proxy unavailable ({_one_line(str(exc))}); use the remote link",
+                 err=True)
+        return None
+    return proxy
 
 
 def _choose_backend_name(flag: str | None, spec_provider: str) -> str:
@@ -272,10 +304,25 @@ def _print_report(report: SyncReport, *, quiet_when_empty: bool = False, err: bo
         _say(line, err=True)
 
 
-def _print_session(session: Session, notebook_arg: str) -> None:
+_ENV_ROLES = {"!": ("!", "warn"), "✓": ("✓", "ok"), "✗": ("✗", "error"), "↻": ("↻", "label"), "·": ("·", "dim")}
+
+
+def _env_line(message: str) -> str:
+    """An EnvWatcher message: its first character picks the symbol and color."""
+    symbol, role = _ENV_ROLES.get(message[:1], ("", "label"))
+    text = message[1:] if symbol else message
+    return f"{_c(symbol + ' env', role)}  {text}"
+
+
+def _print_session(session: Session, notebook_arg: str, proxy: LocalProxy | None = None) -> None:
     click.echo(f"{_c('✓', 'ok')} marimo is running on {_c(session.backend, 'label')} "
                f"{_c(f'({session.runtime_id})', 'dim')}")
-    click.echo(f"  {_c('open:', 'label')}  {_c(session.url_with_token(), 'url')}")
+    if proxy is not None:
+        click.echo(f"  {_c('open:', 'label')}  {_link(proxy.url_with_token(session.token))}")
+        click.echo(f"  {_c('remote:', 'dim')} {_link(session.url_with_token())}  "
+                   f"{_c('(direct; slower to load, works without this terminal)', 'dim')}")
+    else:
+        click.echo(f"  {_c('open:', 'label')}  {_link(session.url_with_token())}")
     click.echo(f"  {_c('rate:', 'label')}  {_rate_text(lifecycle.session_rate(session))}")
     click.echo(f"  {_c('stop:', 'label')}  {_c(f'nbgpu stop {notebook_arg}', 'cmd')}   "
                f"{_c('(the runtime keeps running and billing until then)', 'dim')}")
@@ -343,7 +390,39 @@ class _WatchdogMonitor:
         return None
 
 
-def _sync_loop(session: Session, backend: Backend, store: SessionStore, notebook_arg: str, *, err: bool) -> None:
+def _record_packages(session: Session, events: queue.Queue, env_watcher: EnvWatcher | None, *, err: bool) -> None:
+    """Write packages installed or removed in marimo's UI into the notebook's
+    header on this machine (the next sync pushes it)."""
+    while True:
+        try:
+            added, removed = events.get_nowait()
+        except queue.Empty:
+            return
+        try:
+            text = session.notebook.read_text(encoding="utf-8")
+            new_text, deps = update_dependencies(text, add=added, remove=removed)
+        except (OSError, ValueError) as exc:
+            _say(f"{_c('! env', 'warn')}  could not record {', '.join(added + removed)} in the header: "
+                 f"{_one_line(str(exc))}", err=err)
+            continue
+        if new_text != text:
+            session.notebook.write_text(new_text, encoding="utf-8")
+        if env_watcher is not None:
+            env_watcher.adopt()  # already installed by marimo: nothing to install again
+        changes = [f"+{a}" for a in added] + [f"-{r}" for r in removed]
+        _say(f"{_c('✓ env', 'ok')}  recorded {', '.join(changes)} in {session.notebook.name}'s dependencies "
+             "(changed in marimo)", err=err)
+
+
+def _sync_loop(
+    session: Session,
+    backend: Backend,
+    store: SessionStore,
+    notebook_arg: str,
+    *,
+    err: bool,
+    packages: queue.Queue | None = None,
+) -> None:
     """Sync every second until Ctrl-C (or SIGTERM/SIGHUP), then do a final
     pull; the runtime keeps running. If the idle watchdog stopped marimo,
     pull, terminate the runtime and remove the record instead."""
@@ -352,18 +431,31 @@ def _sync_loop(session: Session, backend: Backend, store: SessionStore, notebook
         last_conflicts: list[str] = []
         engine: SyncEngine | None = None
         handle: RuntimeHandle | None = None
+        env_watcher: EnvWatcher | None = None
         monitor = _WatchdogMonitor()
         next_idle_stop = 0.0
         try:
             while True:
+                if store.load(session.session_id) is None:
+                    # `nbgpu stop` elsewhere did the final pull and removed the record.
+                    _say(f"{_c('✓', 'ok')} session {_c(session.session_id, 'id')} was stopped (by `nbgpu stop`); "
+                         "its files were pulled first. Stopped syncing.", err=err)
+                    return
+                if packages is not None:
+                    _record_packages(session, packages, env_watcher, err=err)
                 try:
                     if engine is None or handle is None:
                         handle = backend.get(session.runtime_id)
+                        if handle is None and store.load(session.session_id) is None:
+                            _say(f"{_c('✓', 'ok')} session {_c(session.session_id, 'id')} was stopped (by `nbgpu stop`); "
+                                 "its files were pulled first. Stopped syncing.", err=err)
+                            return
                         if handle is None:
                             raise lifecycle.SessionNotRunning(
                                 f"the runtime of session {session.session_id} ({session.runtime_id}) is not running"
                             )
-                        engine = lifecycle.session_engine(session, backend=backend, store=store)
+                        engine = lifecycle.session_engine(session, backend=backend, store=store, defer_manifest=True)
+                        env_watcher = EnvWatcher(session, backend, handle, store)
                     idle = monitor.check(session, backend, handle, err=err)
                     if idle is not None:
                         if time.monotonic() >= next_idle_stop:
@@ -374,6 +466,7 @@ def _sync_loop(session: Session, backend: Backend, store: SessionStore, notebook
                         continue
                     report = engine.poll_once()
                     lifecycle.note_synced(session, store)
+
                 except lifecycle.SessionNotRunning:
                     raise
                 except Exception as exc:  # noqa: BLE001 - transient; retry next tick
@@ -382,6 +475,11 @@ def _sync_loop(session: Session, backend: Backend, store: SessionStore, notebook
                         gone = backend.get(session.runtime_id) is None
                     except Exception:  # noqa: BLE001
                         pass
+                    if gone and store.load(session.session_id) is None:
+                        # `nbgpu stop` in another terminal did the final pull and removed the record.
+                        _say(f"{_c('✓', 'ok')} session {_c(session.session_id, 'id')} was stopped (by `nbgpu stop`); "
+                             "its files were pulled first. Stopped syncing.", err=err)
+                        return
                     if gone:
                         raise lifecycle.SessionNotRunning(
                             f"the runtime of session {session.session_id} ({session.runtime_id}) is no longer "
@@ -396,6 +494,12 @@ def _sync_loop(session: Session, backend: Backend, store: SessionStore, notebook
                                        report.skipped if report.changed else [])
                     shown.warnings = _warnings(report)  # type: ignore[attr-defined]
                     _print_report(shown, quiet_when_empty=True, err=err)
+                    if env_watcher is not None:
+                        try:
+                            for message in env_watcher.tick():
+                                _say(_env_line(message), err=err)
+                        except Exception as exc:  # noqa: BLE001 - never stops syncing
+                            _say(f"{_c('! env', 'warn')}  could not check dependencies: {_one_line(str(exc))}", err=err)
                 time.sleep(SYNC_INTERVAL_S)
         except KeyboardInterrupt:
             # Pull first: after SIGHUP the terminal may be gone, and output
@@ -404,6 +508,7 @@ def _sync_loop(session: Session, backend: Backend, store: SessionStore, notebook
                 report = lifecycle.sync_once(session, backend=backend, store=store)
             else:
                 report = engine.final_pull()
+                engine.flush_manifest()
                 lifecycle.note_synced(session, store)
             _say("final pull done", err=err)
             _print_report(report, quiet_when_empty=True, err=err)
@@ -520,13 +625,19 @@ def start(
                               project_root=project_root, progress=progress)
     if not as_json:
         _say(f"  {_c(f'{time.monotonic() - started:5.1f}s', 'dim')}  ready", err=True)
+    packages: queue.Queue = queue.Queue()
+    proxy = None if detach else _start_proxy(session, quiet=as_json, packages=packages)
     if as_json:
-        _emit_json(_session_json(session))
+        _emit_json(_session_json(session, proxy))
     else:
-        _print_session(session, notebook)
+        _print_session(session, notebook, proxy)
     if not detach:
         sys.stdout.flush()
-        _sync_loop(session, backend, store, notebook, err=as_json)
+        try:
+            _sync_loop(session, backend, store, notebook, err=as_json, packages=packages)
+        finally:
+            if proxy is not None:
+                proxy.stop()
 
 
 @main.command("open")
@@ -546,12 +657,18 @@ def open_(notebook: str, as_json: bool) -> None:
     if idle is not None:
         raise CliError(f"the session for {session.notebook} was stopped {_idle_text(idle)}; "
                        f"`nbgpu stop {notebook}` pulls its files and terminates the runtime")
+    packages: queue.Queue = queue.Queue()
+    proxy = _start_proxy(session, quiet=as_json, packages=packages)
     if as_json:
-        _emit_json(_session_json(session))
+        _emit_json(_session_json(session, proxy))
     else:
-        _print_session(session, notebook)
+        _print_session(session, notebook, proxy)
     sys.stdout.flush()
-    _sync_loop(session, backend, store, notebook, err=as_json)
+    try:
+        _sync_loop(session, backend, store, notebook, err=as_json, packages=packages)
+    finally:
+        if proxy is not None:
+            proxy.stop()
 
 
 @main.command()

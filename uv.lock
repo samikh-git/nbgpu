@@ -1007,28 +1007,30 @@ name = "nbgpu"
 version = "0.0.1"
 source = { editable = "." }
 dependencies = [
+    { name = "aiohttp" },
     { name = "click" },
+    { name = "marimo" },
     { name = "modal" },
     { name = "pathspec" },
 ]
 
 [package.dev-dependencies]
 dev = [
-    { name = "marimo" },
     { name = "pytest" },
     { name = "pytest-timeout" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "aiohttp", specifier = ">=3.9" },
     { name = "click", specifier = ">=8.1" },
+    { name = "marimo", specifier = "==0.25.2" },
     { name = "modal", specifier = ">=1.6" },
     { name = "pathspec", specifier = ">=0.12" },
 ]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "marimo", specifier = "==0.25.2" },
     { name = "pytest", specifier = ">=8" },
     { name = "pytest-timeout", specifier = ">=2.3" },
 ]
