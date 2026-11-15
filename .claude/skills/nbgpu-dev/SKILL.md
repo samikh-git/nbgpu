@@ -1,0 +1,109 @@
+---
+name: nbgpu-dev
+description: Work on the nbgpu codebase itself (this repository). Use when changing anything under src/nbgpu or tests, adding a CLI command or flag, adding a `[tool.nbgpu]` header key, adding a provider backend, touching sync, the idle watchdog, the proxy or env sync, or running and debugging the test suite.
+---
+
+# Developing nbgpu
+
+## Layout
+
+| Module | Owns |
+|--------|------|
+| `cli.py` | Click commands, output, the sync loop. Thin: logic lives in `lifecycle`. |
+| `lifecycle.py` | start / run / stop / status / orphans. The start sequence is the module docstring. |
+| `spec.py` | Parsing and validating the PEP 723 header into `NotebookSpec`. |
+| `header.py` | Rewriting only the `dependencies` line of a header. |
+| `sync.py` | Two-way sync engine: hash compare, three-way merge, conflicts, manifest. |
+| `ignore.py` | gitignore layering for what is left out of sync. |
+| `envsync.py` | Live dependency installs and what cannot change in place. |
+| `watchdog.py` | Runs **inside the runtime**; stops marimo when idle. Stdlib only. |
+| `proxy.py` | Localhost proxy serving marimo's static assets from this machine. |
+| `cost.py` | Price table and running totals. |
+| `session.py` | Session records on disk (state directory). |
+| `backends/base.py` | The provider contract (`Backend` protocol). |
+| `backends/modal.py`, `backends/local.py` | Implementations. |
+
+Each module's docstring is its design document and is kept exact. Read it
+before changing the module, and update it in the same change. "Decisions
+beyond the contract" sections record choices the docstring's contract did not
+force; add to them rather than leaving a decision implicit.
+
+`docs/architecture.md` has the cross-module picture.
+
+## Tests
+
+```bash
+uv run pytest                    # unit + contract (local backend) + e2e, ~1-2 min
+uv run pytest tests/unit -q      # fast
+uv run pytest tests/unit tests/contract   # skip the ones that start real marimo
+NBGPU_MODAL_TESTS=1 uv run pytest -m modal   # creates real Modal sandboxes: costs money, ask first
+```
+
+- `tests/unit`: pure logic, with `tests/fakes.py` standing in for a backend.
+- `tests/contract`: one suite run against every backend. A new backend must
+  pass it unchanged.
+- `tests/e2e`: real marimo processes through the local backend.
+
+Never run the `modal` marker without the user's go-ahead. Tests shrink
+timing constants by assigning module globals (`watchdog.CHECK_INTERVAL_S`,
+`lifecycle.MARIMO_ARGV`); code reads those globals at call time for that
+reason, so do not bind them as default arguments.
+
+## Invariants not to break
+
+- **A failed start leaves nothing billing.** After `backend.create`, every
+  failure path terminates the runtime before raising. The provisional record
+  is saved *before* `create` so a slow create is never taken for an orphan.
+- **Sync never overwrites unseen content.** Every write is compare-and-swap
+  against the hash the decision was made on. A conflict writes a copy, never
+  over either side. Deletions are not propagated.
+- **Edits come before output.** On shutdown the final pull runs before any
+  printing, and printing never raises (`_say`).
+- **`watchdog.py` imports nothing from nbgpu.** It is uploaded as a single
+  file. Constants it shares with `sync.py` (`PULL_SUFFIXES`,
+  `EXCLUDED_DIRS`) are duplicated on purpose; change both.
+- **Only this owner's runtimes are ever terminated.** Orphan cleanup filters
+  on the state directory's owner id.
+- **Tokens stay out of the project tree**, locally (state dir, 0600) and
+  remotely (next to `remote_root`, not in it).
+- **`--json` stdout is one JSON document.** Progress goes to stderr.
+- **Missing capabilities are errors, never approximations** (`UnsupportedError`).
+
+## Common changes
+
+**A new `[tool.nbgpu]` key**: add to `KNOWN_KEYS` and parse it in `spec.py`
+(with a `SpecError` naming the key); thread it through `ComputeSpec` or
+`NotebookSpec`; honour it in each backend or raise `UnsupportedError`; decide
+in `envsync.snapshot` whether a change mid-session is reported; test in
+`tests/unit/test_spec.py`; document in `docs/notebook-header.md` and
+`skills/nbgpu-notebook/SKILL.md`.
+
+**A new CLI flag or command**: implement in `lifecycle.py`, wire in `cli.py`
+with `--json`, update the `cli.py` docstring, `docs/cli.md` and
+`skills/nbgpu/references/cli.md`.
+
+**A new backend**: implement `Backend` from `backends/base.py`, register it
+in `backends/__init__.py` (`KNOWN_BACKENDS`, lazy import in `get_backend`),
+add it to the contract suite's fixtures in `tests/contract/conftest.py`, add
+prices to `cost.py`. Requirements that are easy to miss: `write_file`'s
+check-and-replace must be one step inside the runtime; helper execs must set
+`NBGPU_INTERNAL=1` so the watchdog ignores them; tags must be set atomically
+at creation.
+
+**Prices**: `cost.py`'s table has a `checked` date. Update it with the numbers.
+
+## Trying a change by hand
+
+```bash
+NBGPU_BACKEND=local NBGPU_STATE_DIR=/tmp/nbgpu-dev uv run nbgpu start some_cpu_notebook.py
+```
+
+The local backend needs no account and costs nothing, but has no GPU, no
+volumes and no live installs. Use a notebook whose header has no `gpu`. A
+separate `NBGPU_STATE_DIR` keeps test sessions away from real ones.
+
+## Docs and skills travel with the code
+
+User docs are in `docs/`, agent skills in `skills/` (usage) and
+`.claude/skills/` (this one). A behaviour change that a user or agent would
+notice is not done until those say the same thing as the code.
