@@ -16,7 +16,9 @@ non-zero on failure with a one-line error on stderr):
   nbgpu open NOTEBOOK
       Print the URL of the notebook's running session and resume the sync loop.
   nbgpu sync NOTEBOOK
-      One sync pass; prints what moved and any conflicts.
+      One sync pass; prints what moved and any conflicts. Then installs
+      header dependency changes into the runtime (EnvWatcher.apply), so
+      detached sessions get them too.
   nbgpu status [--backend NAME]
       Every session: notebook, backend, GPU, state, uptime, cost so far,
       conflicts; plus runtimes this state directory created that no record
@@ -24,9 +26,15 @@ non-zero on failure with a one-line error on stderr):
       (other laptops, teammates, other NBGPU_STATE_DIRs), which are only listed.
       For a session whose runtime is gone: a warning that browser edits after
       the last successful sync (its time is shown) are lost.
-  nbgpu run NOTEBOOK [--backend NAME] [--max-lines N] [--project-root DIR]
+  nbgpu run NOTEBOOK [--backend NAME] [--max-lines N] [--pull PATTERN]...
+                     [--project-root DIR]
       Run the notebook as a script remotely; prints its output; exits with
-      the notebook's exit code.
+      the notebook's exit code. In a session, header changes are installed
+      first. Afterwards one sync pass brings back what `sync` would, and
+      --pull brings back other matching outputs (lifecycle.pull_matching).
+  nbgpu cost [--days N] [--backend NAME]
+      What the provider actually billed for nbgpu's runtimes, per day and per
+      resource; also refreshes the cached live prices.
   nbgpu stop NOTEBOOK [--force]
       Final pull, terminate, remove the record. --force: stop despite open
       conflicts, and terminate even if the final pull fails.
@@ -45,16 +53,27 @@ Errors: one line on stderr, no traceback, non-zero exit.
 
 --json shapes:
   start:  {"session_id", "notebook", "backend", "runtime_id",
-           "url" (includes access_token), "rate": null | {"usd_per_hour", "complete"}}
+           "url" (includes access_token), "local_url" (when the proxy runs),
+           "rate": null | {"usd_per_hour", "complete", "prices_checked", "prices_source"}}
   status: {"sessions": [{"session_id", "notebook", "backend", "gpu", "running",
-           "state", "uptime_s", "cost_usd", "conflicts", "last_sync_at",
-           "warning", "unsynced"}],
+           "state", "uptime_s", "cost_usd", "prices_checked" (ISO date) and
+           "prices_source" ("live", "list" or "file"; both null when cost_usd
+           is), "conflicts", "last_sync_at", "warning", "unsynced"}],
            "orphans": [{"backend", "runtime_id", "uptime_s", "session_tag"}],
            "other_owners": [same shape]}
+  Rates are estimates from cost.current_prices() at start ($NBGPU_PRICES, else
+  the account's live rates cached by start/cost, else prices.toml); the
+  source and date are recorded with the rate and shown beside it. status
+  never reads prices, so a broken $NBGPU_PRICES cannot hide what is billing.
+  `cost` reports what the provider actually billed (CAP_BILLING).
   sync, stop: {"pushed", "pulled", "merged", "conflicts", "skipped", "warnings"}
+           (sync also "env": header changes installed or reported)
   stop --orphans: {"orphans": [...], "terminated": [ids], "skipped": [ids],
            "failed": {id: error}}
-  run:    {"exit_code", "output", "truncated", "full_output_path"}
+  cost:   {"backend", "start", "end", "days": [{"date", "usd"}], "by_resource",
+           "total_usd", "prices_refreshed", "prices_error"}
+  run:    {"exit_code", "output", "truncated", "full_output_path",
+           "pulled" (files brought back after the run), "warnings", "env"}
 
 Decisions beyond the contract:
 - The chosen backend's name is passed as the spec's `provider` override, so
@@ -85,7 +104,7 @@ from typing import Any, NoReturn
 
 import click
 
-from nbgpu import lifecycle
+from nbgpu import cost, lifecycle
 from nbgpu.backends import get_backend
 from nbgpu.backends.base import Backend, RuntimeHandle
 from nbgpu.cost import Rate, format_usd
@@ -188,7 +207,10 @@ def _report_json(report: SyncReport) -> dict[str, list[str]]:
 
 
 def _rate_json(rate: Rate | None) -> dict[str, object] | None:
-    return None if rate is None else {"usd_per_hour": rate.usd_per_hour, "complete": rate.complete}
+    if rate is None:
+        return None
+    return {"usd_per_hour": rate.usd_per_hour, "complete": rate.complete,
+            "prices_checked": rate.prices_checked or None, "prices_source": rate.prices_source or None}
 
 
 def _rate_text(rate: Rate | None) -> str:
@@ -323,7 +345,10 @@ def _print_session(session: Session, notebook_arg: str, proxy: LocalProxy | None
                    f"{_c('(direct; slower to load, works without this terminal)', 'dim')}")
     else:
         click.echo(f"  {_c('open:', 'label')}  {_link(session.url_with_token())}")
-    click.echo(f"  {_c('rate:', 'label')}  {_rate_text(lifecycle.session_rate(session))}")
+    rate = lifecycle.session_rate(session)
+    note = (f"  {_c(f'({cost.disclaimer(rate.prices_checked, rate.prices_source)})', 'dim')}"
+            if rate is not None and rate.complete else "")
+    click.echo(f"  {_c('rate:', 'label')}  {_rate_text(rate)}{note}")
     click.echo(f"  {_c('stop:', 'label')}  {_c(f'nbgpu stop {notebook_arg}', 'cmd')}   "
                f"{_c('(the runtime keeps running and billing until then)', 'dim')}")
 
@@ -679,10 +704,14 @@ def sync(notebook: str, as_json: bool) -> None:
     store = SessionStore()
     session, backend = _find_session(notebook, store)
     report = lifecycle.sync_once(session, backend=backend, store=store)
+    handle = lifecycle.resolve_handle(session, backend)
+    env = lifecycle.apply_env(session, backend=backend, handle=handle, store=store).messages if handle else []
     if as_json:
-        _emit_json(_report_json(report))
+        _emit_json({**_report_json(report), "env": [m[1:] for m in env]})
     else:
         _print_report(report)
+        for message in env:
+            click.echo(_env_line(message))
 
 
 _STATE_TEXT = {
@@ -739,6 +768,8 @@ def status(backend_name: str | None, as_json: bool) -> None:
                     "state": e.state,
                     "uptime_s": e.uptime_s,
                     "cost_usd": e.cost_usd,
+                    "prices_checked": (e.rate.prices_checked or None) if e.cost_usd is not None and e.rate else None,
+                    "prices_source": (e.rate.prices_source or None) if e.cost_usd is not None and e.rate else None,
                     "conflicts": list(e.conflicts),
                     "last_sync_at": e.last_sync_at,
                     "warning": e.warning,
@@ -771,6 +802,11 @@ def status(backend_name: str | None, as_json: bool) -> None:
             click.echo(f"  {_c('last sync:', 'dim')} {_c(lifecycle.format_time(e.last_sync_at), 'dim')}")
         if e.warning:
             click.echo(f"  {_c('WARNING:', 'error')} {e.warning}")
+    for checked, source in sorted({(e.rate.prices_checked, e.rate.prices_source)
+                                   for e in entries if e.cost_usd is not None and e.rate}):
+        click.echo(_c(f"rate and cost: {cost.disclaimer(checked, source)}", "dim"))
+    if any(e.cost_usd is not None for e in entries):
+        click.echo(_c("what was actually billed: nbgpu cost", "dim"))
     if orphans:
         click.echo(_c("untracked runtimes (terminate with `nbgpu stop --orphans`):", "warn"))
         for o in orphans:
@@ -779,6 +815,47 @@ def status(backend_name: str | None, as_json: bool) -> None:
         click.echo(_c("nbgpu runtimes of other owners (other laptops, teammates or state directories):", "dim"))
         for o in others:
             click.echo(f"  {_other_line(o)}")
+
+
+@main.command(name="cost")
+@click.option("--days", type=click.IntRange(1, 31), default=7, show_default=True,
+              help="Complete days to report, plus today so far.")
+@click.option("--backend", "backend_name", help="Provider to ask (default: $NBGPU_BACKEND, else modal).")
+@json_option
+def cost_(days: int, backend_name: str | None, as_json: bool) -> None:
+    """What nbgpu's runtimes were actually billed, from the provider.
+
+    Also refreshes the cached copy of your account's current prices, used
+    for the rates `start` and `status` show."""
+    name = backend_name or os.environ.get("NBGPU_BACKEND") or "modal"
+    backend = get_backend(name)
+    store = SessionStore()
+    price_error = lifecycle.refresh_live_prices(backend, store.directory, force=True)
+    report = lifecycle.spend(backend, days)
+    if as_json:
+        _emit_json({
+            "backend": name,
+            "start": report.start.isoformat(),
+            "end": report.end.isoformat(),
+            "days": [{"date": d, "usd": c} for d, c in report.days],
+            "by_resource": report.by_resource,
+            "total_usd": report.total,
+            "prices_refreshed": price_error is None,
+            "prices_error": price_error,
+        })
+        return
+    click.echo(f"billed for nbgpu's runtimes on {_c(name, 'label')}, "
+               f"{report.start:%Y-%m-%d} to {report.end:%Y-%m-%d %H:%M} UTC:")
+    for day, usd in report.days:
+        click.echo(f"  {day}  {_c(format_usd(usd), 'money')}")
+    click.echo(f"  {'total':<10}  {_c(format_usd(report.total), 'money')}")
+    if report.by_resource:
+        parts = ", ".join(f"{k} {format_usd(v)}" for k, v in report.by_resource.items())
+        click.echo(f"  {_c('by resource:', 'dim')} {parts}")
+    click.echo(_c("Complete hours only, and the provider's report can lag by an hour or more; "
+                  "`nbgpu status` estimates what is running now.", "dim"))
+    if price_error is not None:
+        click.echo(f"{_c('warning:', 'warn')} could not refresh prices: {_one_line(price_error)}", err=True)
 
 
 def _duration(seconds: float) -> str:
@@ -792,10 +869,17 @@ def _duration(seconds: float) -> str:
 @click.argument("notebook")
 @click.option("--backend", "backend_name", help="Backend to use (default: $NBGPU_BACKEND, else the spec's provider).")
 @click.option("--max-lines", type=click.IntRange(min=1), default=200, show_default=True, help="Output lines to show.")
+@click.option("--pull", "pull", multiple=True, metavar="PATTERN",
+              help="Also bring back runtime files matching PATTERN (.gitignore syntax, relative to the project "
+                   "root), of any type and size up to 200 MB. Repeatable.")
 @project_root_option
 @json_option
-def run(notebook: str, backend_name: str | None, max_lines: int, project_root: Path | None, as_json: bool) -> None:
-    """Run NOTEBOOK as a script remotely and exit with its exit code."""
+def run(notebook: str, backend_name: str | None, max_lines: int, pull: tuple[str, ...], project_root: Path | None,
+        as_json: bool) -> None:
+    """Run NOTEBOOK as a script remotely and exit with its exit code.
+
+    Afterwards the files the run wrote come back as with `nbgpu sync`, plus
+    any matching --pull. In a session, header changes are installed first."""
     store = SessionStore()
     spec = load_spec(Path(notebook))
     existing = _running_session(spec.path, store)
@@ -803,23 +887,33 @@ def run(notebook: str, backend_name: str | None, max_lines: int, project_root: P
     if existing is not None and backend_name in (None, existing[0].backend) and project_root is None:
         session, backend = existing
         result = lifecycle.run(spec.path, backend=backend, session=session, store=store,
-                               max_output_lines=max_lines, output_dir=output_dir)
+                               max_output_lines=max_lines, output_dir=output_dir, pull=pull)
     else:
         name = _choose_backend_name(backend_name, spec.compute.provider)
         result = lifecycle.run(spec.path, backend=get_backend(name), overrides={"provider": name}, store=store,
-                               max_output_lines=max_lines, output_dir=output_dir, project_root=project_root)
+                               max_output_lines=max_lines, output_dir=output_dir, project_root=project_root,
+                               pull=pull)
     if as_json:
         _emit_json({
             "exit_code": result.exit_code,
             "output": result.output,
             "truncated": result.truncated,
             "full_output_path": None if result.full_output_path is None else str(result.full_output_path),
+            "pulled": result.pulled,
+            "warnings": result.warnings,
+            "env": [m[1:] for m in result.env],
         })
     else:
+        for message in result.env:
+            click.echo(_env_line(message), err=True)
         if result.output:
             click.echo(result.output)
         if result.truncated:
             click.echo(_c(f"(output truncated; full output in {result.full_output_path})", "dim"), err=True)
+        for path in result.pulled:
+            click.echo(f"{_c('↓ pulled  ', 'ok')} {path}", err=True)
+        for warning in result.warnings:
+            click.echo(f"{_c('warning:', 'warn')} {warning}", err=True)
     sys.exit(result.exit_code)
 
 

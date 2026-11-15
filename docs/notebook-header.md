@@ -154,8 +154,8 @@ nbgpu start train.py --gpu H100 --max-runtime 2h
 
 | Change | In a running session |
 |--------|----------------------|
-| Add a dependency | Installed live (with a sync loop running) |
-| Upgrade a dependency | Installed live; restart the kernel to load it |
+| Add a dependency | Installed live by the sync loop, or by the next `nbgpu sync` or `nbgpu run` |
+| Upgrade a dependency | Installed the same way; restart the kernel to load it in the browser |
 | Remove a dependency | Stays installed until the next start |
 | `gpu`, `cpu`, `memory`, `volumes`, `requires-python` | Next start |
 | `exclude` | Next start |

@@ -1,0 +1,51 @@
+# Price table used to estimate what a runtime costs.
+#
+# These are list prices copied by hand from the providers' pricing pages on
+# the `checked` date. They are the fallback: when the backend can report
+# your account's current rates (Modal can), nbgpu fetches and caches those
+# and uses them instead. To use your own numbers, copy this file and point
+# NBGPU_PRICES at the copy; that wins over both.
+#
+# Every price is in US dollars PER SECOND, exactly as Modal lists them, so the
+# numbers can be compared with the pricing page directly. nbgpu multiplies by
+# 3600 to get hourly rates.
+
+checked = "2026-11-15"  # ISO date the numbers below were last compared with `sources`
+sources = [
+  "https://modal.com/pricing",
+  "https://modal.com/docs/guide/gpu",
+]
+
+[modal]
+# nbgpu runs on Modal Sandboxes, which are "billed at non-preemptible rates of
+# 3x list price" for CPU and memory, so these are the sandbox rates.
+#
+# CPU is per physical core ("Physical core (2 vCPU equivalent)"); `cpu` in the
+# notebook header is also in physical cores. Modal bills max(request, usage)
+# with a 0.125-core minimum; nbgpu prices the request only.
+cpu-core = 0.00003942
+memory-gib = 0.00000667
+
+[modal.gpu]
+# Aliases, per https://modal.com/docs/guide/gpu:
+# - A10G: the older name for Modal's A10; priced as "Nvidia A10".
+# - A100: a 40 GB request; Modal may upgrade it to 80 GB, which "does not
+#   change the cost", so it is priced as A100-40GB.
+# - H100!: an H100 with automatic H200 upgrade disabled; priced as H100.
+# - B200+: "billed as B200, regardless of which GPU is used".
+# Region selection (1.15 - 1.75x base prices) is not included.
+T4 = 0.000164
+L4 = 0.000222
+A10 = 0.000306
+A10G = 0.000306
+L40S = 0.000542
+A100 = 0.000583
+A100-40GB = 0.000583
+A100-80GB = 0.000694
+RTX-PRO-6000 = 0.000842
+H100 = 0.001097
+"H100!" = 0.001097
+H200 = 0.001261
+B200 = 0.001736
+"B200+" = 0.001736
+B300 = 0.001972

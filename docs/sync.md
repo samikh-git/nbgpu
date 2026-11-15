@@ -43,7 +43,8 @@ most 1 MiB, with one of these suffixes:
 ```
 
 This keeps checkpoints, plots and datasets written by a notebook from
-flooding your working tree. For those, mount a
+flooding your working tree. To bring specific ones back, use
+[`nbgpu run --pull`](cli.md#nbgpu-run). For large ones, mount a
 [volume](notebook-header.md#volumes).
 
 Deletions are not propagated in either direction. Deleting a file locally
@@ -55,7 +56,7 @@ leaves the remote copy, and the other way round.
 |---|---|
 | `nbgpu start`, `nbgpu open` | every second, until Ctrl-C |
 | `nbgpu sync` | once |
-| `nbgpu run` (in a session) | once, before running |
+| `nbgpu run` | once before running (in a session), once after |
 | `nbgpu stop` | once, before terminating |
 
 With `nbgpu start --detach` and nothing else, there is no background sync.

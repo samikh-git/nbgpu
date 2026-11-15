@@ -10,8 +10,8 @@ from pathlib import Path
 
 import pytest
 
-from nbgpu.backends.base import CAP_LIVE_INSTALL
-from nbgpu.envsync import EXTRA_ENV, INSTALL_ARGV, EnvWatcher, applied_extra
+from nbgpu.backends.base import CAP_LIVE_INSTALL, ExecResult
+from nbgpu.envsync import EXTRA_ENV, INSTALL_ARGV, EnvWatcher, _EnvLock, applied_extra
 from nbgpu.session import Session, SessionStore
 from nbgpu.spec import load_spec
 from tests.fakes import FakeBackend, fake_request
@@ -39,11 +39,17 @@ class InstallBackend(FakeBackend):
         self.capabilities = frozenset({CAP_LIVE_INSTALL}) if live else frozenset()
         self.spawned: list[list[str]] = []
         self.next = Proc()
+        self.executed: list[list[str]] = []
+        self.next_exec = ExecResult(0, "", "")
 
     def spawn(self, handle, argv, *, cwd=None, env=None):  # type: ignore[no-untyped-def]
         self.spawned.append(list(argv))
         proc, self.next = self.next, Proc()
         return proc
+
+    def exec(self, handle, argv, *, cwd=None, env=None, timeout_s=None):  # type: ignore[no-untyped-def]
+        self.executed.append(list(argv))
+        return self.next_exec
 
 
 def header(deps: Sequence[str], extra: str = "") -> str:
@@ -200,3 +206,84 @@ def test_stop_lists_installs_the_notebook_does_not_name(tmp_path: Path, monkeypa
     spec = load_spec(nb)
     assert envsync.unrecorded_installs(backend, handle, "/x/baseline.json", spec) == ["polars==1.2.0"]
     assert envsync.unrecorded_installs(InstallBackend(live=False), handle, "/x", spec) is None
+
+
+# --------------------------------------------------------------------------
+# apply(): `nbgpu run` and `nbgpu sync` without a loop
+# --------------------------------------------------------------------------
+
+
+def _watcher(store, backend, nb):  # another process's view of the same session
+    session = store.load("s1")
+    return EnvWatcher(session, backend, backend.get(session.runtime_id), store)
+
+
+def test_apply_installs_and_waits(env) -> None:
+    nb, backend, watcher, store = env()
+    write(nb, header(["marimo", "polars"]))
+    applied = watcher.apply()
+    assert not applied.failed and applied.messages[0].startswith("✓") and "polars" in applied.messages[0]
+    assert backend.executed == [[*INSTALL_ARGV, "marimo", "polars"]] and backend.spawned == []
+    assert json.loads(store.load("s1").extra[EXTRA_ENV])["deps"] == ["marimo", "polars"]  # type: ignore[union-attr]
+    assert watcher.apply().messages == [] and len(backend.executed) == 1
+
+
+def test_apply_reports_a_failed_install(env) -> None:
+    nb, backend, watcher, store = env()
+    backend.next_exec = ExecResult(1, "", "  × No solution found\n  ╰─▶ nope==99 was not found")
+    write(nb, header(["marimo", "nope==99"]))
+    applied = watcher.apply()
+    assert applied.failed and "nope==99 was not found" in applied.messages[0]
+    assert json.loads(store.load("s1").extra[EXTRA_ENV])["deps"] == ["marimo"]  # type: ignore[union-attr]
+
+
+def test_apply_without_live_install_only_reports(env) -> None:
+    nb, backend, watcher, _ = env(live=False)
+    write(nb, header(["marimo", "polars"]))
+    applied = watcher.apply()
+    assert not applied.failed and "restart the session" in applied.messages[0] and backend.executed == []
+
+
+def test_apply_gives_up_while_another_install_holds_the_lock(env, tmp_path: Path) -> None:
+    nb, backend, watcher, store = env()
+    other = _EnvLock(store, "s1")
+    assert other.acquire()
+    write(nb, header(["marimo", "polars"]))
+    applied = watcher.apply(timeout_s=0.3)
+    assert applied.failed and "still running" in applied.messages[0] and backend.executed == []
+    other.release()
+    assert not watcher.apply().failed
+
+
+def test_the_loop_waits_for_a_run_and_does_not_reinstall_its_work(env) -> None:
+    nb, backend, loop, store = env()
+    run = _watcher(store, backend, nb)
+    lock = _EnvLock(store, "s1")
+    assert lock.acquire()  # `nbgpu run` is installing
+    write(nb, header(["marimo", "polars"]))
+    assert loop.tick() == [] and backend.spawned == []  # busy: look again next tick
+    lock.release()
+    assert not run.apply().failed and len(backend.executed) == 1
+    assert loop.tick() == [] and backend.spawned == []  # the run's install is seen in the record
+
+
+def test_a_run_waits_for_the_loops_install(env) -> None:
+    nb, backend, loop, store = env()
+    backend.next = Proc(code=None)
+    write(nb, header(["marimo", "polars"]))
+    assert loop.tick()[0].startswith("↻")
+    run = _watcher(store, backend, nb)
+    assert run.apply(timeout_s=0.2).failed  # the loop holds the lock while installing
+    loop._install.proc.code = 0  # type: ignore[union-attr]
+    assert loop.tick()[0].startswith("✓")
+    assert run.apply().messages == [] and backend.executed == []  # already installed by the loop
+
+
+def test_a_backend_override_is_not_a_provider_change(env) -> None:
+    nb, backend, watcher, store = env()
+    session = store.load("s1")
+    applied = json.loads(session.extra[EXTRA_ENV])  # type: ignore[union-attr]
+    applied["compute"]["provider"] = "local"  # started with NBGPU_BACKEND=local; header says modal
+    session.extra = {**session.extra, EXTRA_ENV: json.dumps(applied)}  # type: ignore[union-attr]
+    store.save(session)  # type: ignore[arg-type]
+    assert _watcher(store, backend, nb).apply().messages == []

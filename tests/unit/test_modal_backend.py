@@ -15,6 +15,7 @@ import pytest
 from nbgpu.backends import modal as mb
 from nbgpu.backends.base import (
     ABSENT,
+    CAP_BILLING,
     CAP_GPU,
     CAP_LIVE_INSTALL,
     CAP_IDLE_TIMEOUT,
@@ -50,7 +51,7 @@ def test_init_does_not_contact_modal(monkeypatch: pytest.MonkeyPatch) -> None:
     assert backend.app_name == "nbgpu"
     assert backend.name == "modal"
     assert backend.bind_host == "0.0.0.0"
-    assert backend.capabilities == frozenset({CAP_GPU, CAP_VOLUMES, CAP_MAX_RUNTIME, CAP_LIVE_INSTALL})
+    assert backend.capabilities == frozenset({CAP_GPU, CAP_VOLUMES, CAP_MAX_RUNTIME, CAP_LIVE_INSTALL, CAP_BILLING})
     assert CAP_IDLE_TIMEOUT not in backend.capabilities
 
 
@@ -757,3 +758,26 @@ def test_create_cleanup_off_main_thread_leaves_signals_alone(monkeypatch: pytest
     t.start()
     t.join(10)
     assert errors == [] and calls == ["sb-t"]
+
+
+def test_prices_from_rates_maps_every_known_gpu() -> None:
+    rates = {
+        "gpu_hour_cost_t4": "0.59", "gpu_hour_cost_l4": "0.8", "gpu_hour_cost_a10g": "1.1",
+        "gpu_hour_cost_l40s": "1.95", "gpu_hour_cost_a100_40gb": "2.1", "gpu_hour_cost_a100_80gb": "2.5",
+        "gpu_hour_cost_rtx6000": "3.03", "gpu_hour_cost_h100": "3.95", "gpu_hour_cost_h200": "4.54",
+        "gpu_hour_cost_b200": "6.25", "gpu_hour_cost_b300": "7.1",
+        "cpu_hour_cost": "0.0473", "cpu_hour_cost_sandbox": "0.1419", "mem_gib_hour_cost_sandbox": "0.024",
+    }
+    prices = mb.prices_from_rates(rates)
+    assert set(prices.gpu_hourly) == set(mb.KNOWN_GPUS)
+    assert prices.gpu_hourly["A10"] == prices.gpu_hourly["A10G"] == 1.1
+    assert prices.gpu_hourly["A100"] == 2.1 and prices.gpu_hourly["H100!"] == 3.95
+    assert prices.gpu_hourly["RTX-PRO-6000"] == 3.03 and prices.gpu_hourly["B200+"] == 6.25
+    assert prices.cpu_core_hourly == 0.1419  # the sandbox rate, not the function rate
+    assert prices.memory_gib_hourly == 0.024
+
+
+def test_prices_from_rates_leaves_out_missing_or_bad_keys() -> None:
+    prices = mb.prices_from_rates({"gpu_hour_cost_t4": "n/a", "gpu_hour_cost_l4": "0.8"})
+    assert prices.gpu_hourly == {"L4": 0.8}
+    assert prices.cpu_core_hourly is None and prices.memory_gib_hourly is None

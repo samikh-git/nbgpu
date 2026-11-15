@@ -14,6 +14,7 @@ replacement for it.
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
+from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -28,6 +29,10 @@ CAP_MAX_RUNTIME = "max-runtime"  # backend enforces spec.compute.max_runtime_s
 # Packages can be installed into the running runtime's own Python (an
 # isolated environment). The local backend lacks it: its Python is the user's.
 CAP_LIVE_INSTALL = "live-install"
+# The provider can report its current prices and what this tool's runtimes
+# actually cost: the backend has `current_prices()` and `spend()` (see
+# BillingBackend).
+CAP_BILLING = "billing"
 
 
 # Prefix for temporary files made by atomic writes, locally and remotely.
@@ -186,4 +191,36 @@ class Backend(Protocol):
 
     def terminate(self, handle: RuntimeHandle) -> None:
         """Stop and release the runtime. No error if already gone."""
+        ...
+
+
+@dataclass(frozen=True)
+class ProviderPrices:
+    """A provider's current prices, in USD per hour."""
+
+    gpu_hourly: Mapping[str, float]  # by GPU name as written in the header (e.g. "A100-80GB")
+    cpu_core_hourly: float | None  # per core, at the rate the runtimes are billed
+    memory_gib_hourly: float | None  # per GiB
+
+
+@dataclass(frozen=True)
+class SpendRow:
+    """What this tool's runtimes cost in one interval, as billed."""
+
+    interval_start: datetime  # UTC
+    cost: float  # USD
+    by_resource: Mapping[str, float]  # e.g. {"A10G": 1.2, "CPU": 0.1}; keys are the provider's
+
+
+class BillingBackend(Backend, Protocol):
+    """A Backend with CAP_BILLING."""
+
+    def current_prices(self) -> ProviderPrices:
+        """The provider's current prices for this account. Raises BackendError."""
+        ...
+
+    def spend(self, start: datetime, end: datetime, resolution: str) -> list[SpendRow]:
+        """Billed cost of this tool's runtimes between `start` (inclusive) and
+        `end` (exclusive), both UTC, per interval: resolution "h" or "d".
+        Only complete intervals are reported. Raises BackendError."""
         ...

@@ -75,7 +75,7 @@ starting hello.py on modal...
 ✓ marimo is running on modal (sb-...)
   open:   http://127.0.0.1:2718?access_token=...
   remote: https://....modal.host?access_token=...  (direct; slower to load, works without this terminal)
-  rate:   $0.59/h
+  rate:   $0.59/h  (estimate from your account's rates as of 2026-11-15)
   stop:   nbgpu stop hello.py   (the runtime keeps running and billing until then)
 syncing every second; Ctrl-C to stop syncing (the runtime keeps running)
 ```
@@ -121,7 +121,8 @@ nbgpu run hello.py
 Runs `python hello.py` on the remote machine and prints its output, then
 exits with the notebook's exit code. With no session running it creates a
 runtime for the run and terminates it afterwards. With a session running it
-runs there, after syncing your latest edits.
+runs there, after syncing your latest edits. Small text files the run
+writes come back afterwards; `--pull 'plots/'` brings back others.
 
 ## See what is running
 
@@ -130,7 +131,8 @@ nbgpu status
 ```
 
 Lists every session with its uptime, rate and cost so far, plus any runtime
-that is running without a record.
+that is running without a record. `nbgpu cost` shows what Modal actually
+billed.
 
 ## Trying it without a cloud account
 

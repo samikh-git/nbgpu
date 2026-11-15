@@ -113,7 +113,10 @@ laptop has not pulled yet. Per path, the hash listed is:
   is not mistaken for "unpulled";
 * for remote files that are never pulled (not `pull_allowed`, e.g. notebook
   outputs), the hash they had when rejected: there is nothing to pull, and
-  listing them keeps them from looking like pending edits forever.
+  listing them keeps them from looking like pending edits forever;
+* for remote files that .gitignore or [tool.nbgpu] exclude leave out of
+  sync, the hash the last poll saw, for the same reason (the watchdog does
+  not know the ignore rules).
 
 Paths skipped in a round keep their old base, so they correctly look
 unpulled. The manifest is rewritten only when its file list changes or at
@@ -289,6 +292,36 @@ def pull_allowed(path: str, size: int) -> bool:
     return PurePosixPath(path).suffix in PULL_SUFFIXES and size <= PULL_MAX_BYTES
 
 
+def local_target(root: Path, rel: str) -> Path | None:
+    """Where `rel` lives under `root`, or None if writing there is unsafe:
+    the path is not a plain relative path, a parent is a symlink or not a
+    directory, or the target exists and is not a regular file (a symlink
+    included). Nothing outside the root is ever reachable."""
+    if not is_safe_relpath(rel):
+        return None
+    parts = rel.split("/")
+    path = root
+    for i, part in enumerate(parts):
+        path = path / part
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            return root.joinpath(*parts)  # the rest does not exist yet
+        if stat.S_ISLNK(st.st_mode):
+            return None
+        is_last = i == len(parts) - 1
+        if not is_last and not stat.S_ISDIR(st.st_mode):
+            return None
+        if is_last and not stat.S_ISREG(st.st_mode):
+            return None
+    return path
+
+
+def write_local_file(target: Path, data: bytes) -> None:
+    """Atomically create or replace `target` (see _atomic_write)."""
+    _atomic_write(target, data)
+
+
 def is_safe_relpath(path: str) -> bool:
     """A plain relative POSIX path: not empty or absolute, no "", "." or ".."
     parts, no NUL. Remote paths failing this are never written locally."""
@@ -443,6 +476,9 @@ class _State:
     # Remote files not allowed to be pulled, by the hash they had when
     # checked, so an unchanged one is not read again on every poll.
     rejected_remote: dict[str, str] = field(default_factory=dict)
+    # Remote files the ignore rules leave out, by hash, as of the last poll;
+    # only listed in the manifest.
+    ignored_remote: dict[str, str] = field(default_factory=dict)
     # rel -> (size, mtime_ns, ctime_ns, ino, hash) of the local file, to skip
     # re-hashing.
     local_index: dict[str, tuple[int, int, int, int, str]] = field(default_factory=dict)
@@ -478,6 +514,7 @@ class _State:
                     for rel, c in conflicts_raw.items()
                 }
             rejected = {str(k): str(v) for k, v in raw.get("rejected_remote", {}).items()}
+            ignored = {str(k): str(v) for k, v in raw.get("ignored_remote", {}).items()}
             # Version 2 entries (size, mtime, hash) lack ctime and inode:
             # dropped, so those files are simply re-hashed once.
             index = {
@@ -491,6 +528,7 @@ class _State:
                 bases=bases,
                 conflicts=conflicts,
                 rejected_remote=rejected,
+                ignored_remote=ignored,
                 local_index=index,
                 manifest_path=manifest.get("path"),
                 manifest_digest=manifest.get("digest"),
@@ -514,6 +552,7 @@ class _State:
                 rel: {"copy": c.copy, "copy_hash": c.copy_hash} for rel, c in sorted(self.conflicts.items())
             },
             "rejected_remote": dict(sorted(self.rejected_remote.items())),
+            "ignored_remote": dict(sorted(self.ignored_remote.items())),
             "local_index": {rel: list(entry) for rel, entry in sorted(self.local_index.items())},
             "manifest": {
                 "path": self.manifest_path,
@@ -734,7 +773,8 @@ class SyncEngine:
 
     def _manifest_files(self) -> dict[str, str]:
         """rel -> hash for the manifest (see "Synced manifest")."""
-        files = dict(self._state.rejected_remote)
+        files = dict(self._state.ignored_remote)
+        files.update(self._state.rejected_remote)
         files.update({rel: b.hash for rel, b in self._state.bases.items()})
         for rel, conflict in self._state.conflicts.items():
             base = self._state.bases.get(rel)
@@ -846,11 +886,17 @@ class SyncEngine:
                 self._manifest_path, pending[1], pending[2])
         else:
             hashed = self._backend.hash_files(self._handle)
+        ignored: dict[str, str] = {}
         for rel, digest in hashed.items():
             if not is_safe_relpath(rel):
                 report.skip(rel)
-            elif _syncable(rel) and rel not in copies and not self._ignore.is_ignored(rel):
+            elif not _syncable(rel) or rel in copies:
+                continue
+            elif self._ignore.is_ignored(rel):
+                ignored[rel] = digest
+            else:
                 remote[rel] = digest
+        self._state.ignored_remote = ignored
         return remote
 
     # -- per-path logic -----------------------------------------------------
@@ -1087,28 +1133,7 @@ class SyncEngine:
     # -- helpers -------------------------------------------------------------
 
     def _local_target(self, rel: str) -> Path | None:
-        """Where `rel` lives locally, or None if writing there is unsafe: the
-        path is not a plain relative path, a parent is a symlink or not a
-        directory, or the target exists and is not a regular file (a symlink
-        included). Nothing outside the root is ever reachable."""
-        if not is_safe_relpath(rel):
-            return None
-        parts = rel.split("/")
-        path = self._root
-        for i, part in enumerate(parts):
-            path = path / part
-            try:
-                st = os.lstat(path)
-            except FileNotFoundError:
-                return self._root.joinpath(*parts)  # the rest does not exist yet
-            if stat.S_ISLNK(st.st_mode):
-                return None
-            is_last = i == len(parts) - 1
-            if not is_last and not stat.S_ISDIR(st.st_mode):
-                return None
-            if is_last and not stat.S_ISREG(st.st_mode):
-                return None
-        return path
+        return local_target(self._root, rel)
 
     def _create_conflict_copy(self, rel: str, data: bytes) -> str | None:
         """Create a new conflict copy of `rel` holding `data` under the first

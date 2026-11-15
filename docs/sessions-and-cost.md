@@ -116,21 +116,82 @@ the record is kept in `starting` state so the runtime stays visible in
 
 ## Cost
 
-`nbgpu start` prints the hourly rate. `nbgpu status` prints the rate and the
-cost so far (rate × uptime).
+Two different numbers:
+
+- **Estimates** while you work. `nbgpu start` prints the hourly rate.
+  `nbgpu status` prints the rate and the cost so far (rate × uptime).
+- **The bill** afterwards. `nbgpu cost` asks Modal what nbgpu's runtimes were
+  actually billed, per day and per resource. See
+  [`nbgpu cost`](cli.md#nbgpu-cost).
+
+Every estimate says which prices it used:
+
+```text
+  rate:   $0.59/h  (estimate from your account's rates as of 2026-11-15)
+```
 
 The rate is the sum of the GPU price × count, the CPU price × cores and the
-memory price × GiB, from a table of Modal's list prices built into nbgpu
-(`src/nbgpu/cost.py`, with the date it was last checked). CPU and memory use
-Modal's sandbox rates.
+memory price × GiB. CPU and memory use Modal's sandbox rates.
 
-These are estimates to keep you oriented, not invoices:
+### Where the prices come from
+
+First match wins:
+
+1. **`NBGPU_PRICES`**, if set: your own price file (see below).
+2. **Your account's current rates.** Modal reports the rates for your
+   workspace (`Workspace.billing.rates()` in its SDK). nbgpu fetches them
+   while a runtime is being created, at most once a day, and keeps a copy in
+   the state directory; `nbgpu cost` refreshes it too. The copy is used for
+   up to 7 days. Labelled "your account's rates".
+3. **The built-in table**:
+   [`src/nbgpu/prices.toml`](../src/nbgpu/prices.toml), Modal's list prices
+   copied by hand from [modal.com/pricing](https://modal.com/pricing), with
+   the date they were checked. It keeps Modal's per-second units so each
+   number can be compared with the pricing page directly. Labelled "list
+   prices"; once its date is more than 120 days old, the output adds "may be
+   out of date". This is what you get offline, before the first fetch, or on
+   a backend that cannot report prices.
+
+The source and date are recorded with the session when it starts, so
+`status` shows the prices that were actually used, and never needs to read
+them again.
+
+### Using your own prices
+
+Copy the file from your checkout, edit it, and point `NBGPU_PRICES` at the
+copy:
+
+```bash
+cp src/nbgpu/prices.toml ~/.config/nbgpu-prices.toml
+```
+
+```bash
+export NBGPU_PRICES=~/.config/nbgpu-prices.toml
+```
+
+The copy replaces both other sources entirely. A malformed file is an error,
+not a silent zero. The format:
+
+```toml
+checked = "2026-11-15"              # when you last verified these
+sources = ["https://modal.com/pricing"]
+
+[modal]                             # one table per provider
+cpu-core = 0.00003942               # USD per physical core per second
+memory-gib = 0.00000667             # USD per GiB per second
+
+[modal.gpu]                         # USD per GPU per second
+T4 = 0.000164
+"H100!" = 0.001097                  # quote names with punctuation
+```
+
+### What the estimate leaves out
 
 - CPU and memory are only counted when the header requests them; Modal's
   defaults are not priced.
 - Modal bills the larger of what you request and what you use.
 - Region multipliers are not included.
-- The table is as current as its `checked` date.
+- Discounts, credits and plan-specific pricing are not included.
 
 A rate shown as `unknown` means the GPU or provider is not in the table.
 Modal's dashboard has the authoritative numbers.
@@ -144,3 +205,4 @@ Modal's dashboard has the authoritative numbers.
 - Use `nbgpu run` for jobs that do not need the UI. Its runtime exists only
   for the length of the run.
 - Run `nbgpu status` before closing the laptop.
+- Check `nbgpu cost` now and then against what you expected.

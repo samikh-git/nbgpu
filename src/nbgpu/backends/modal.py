@@ -20,7 +20,13 @@
 - GPU strings are validated against a known list before anything is
   created; an unknown one raises UnsupportedError listing the known ones.
 
-Capabilities: gpu, volumes, max-runtime (not idle-timeout; see below).
+Capabilities: gpu, volumes, max-runtime, live-install, billing (not
+idle-timeout; see below).
+
+Billing: `current_prices` reads Workspace.billing.rates() (this workspace's
+current hourly rates) and `spend` reads Workspace.billing.report(), keeping
+the rows of this backend's App. Modal attributes cost to Apps, not to
+sandboxes, so spend is for all of nbgpu's runtimes together, not per session.
 
 Implementation notes (checked against modal 1.6.4):
 
@@ -81,10 +87,12 @@ import uuid
 import zlib
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from nbgpu.backends.base import (
     ABSENT,
+    CAP_BILLING,
     CAP_GPU,
     CAP_LIVE_INSTALL,
     CAP_MAX_RUNTIME,
@@ -92,8 +100,10 @@ from nbgpu.backends.base import (
     TEMP_PREFIX,
     BackendError,
     ExecResult,
+    ProviderPrices,
     RuntimeHandle,
     RuntimeRequest,
+    SpendRow,
     UnsupportedError,
 )
 from nbgpu.spec import NotebookSpec
@@ -126,6 +136,39 @@ KNOWN_GPUS: dict[str, int] = {
     "B200+": 8,
     "B300": 8,
 }
+
+# Key in Workspace.billing.rates() for each KNOWN_GPUS name, where it is not
+# simply the name lower-cased with "-" as "_". Aliases are priced as the GPU
+# they are billed as (see the notes in nbgpu/prices.toml).
+_RATE_KEY_ALIASES = {
+    "A10": "a10g",
+    "A100": "a100_40gb",
+    "RTX-PRO-6000": "rtx6000",
+    "H100!": "h100",
+    "B200+": "b200",
+}
+# Sandboxes are billed at the sandbox CPU and memory rates.
+_RATE_CPU = "cpu_hour_cost_sandbox"
+_RATE_MEMORY = "mem_gib_hour_cost_sandbox"
+
+
+def gpu_rate_key(name: str) -> str:
+    return "gpu_hour_cost_" + _RATE_KEY_ALIASES.get(name, name.lower().replace("-", "_"))
+
+
+def prices_from_rates(rates: Mapping[str, Any]) -> ProviderPrices:
+    """ProviderPrices from Workspace.billing.rates() (USD per hour). Keys
+    that are missing or not numbers are left out."""
+
+    def number(key: str) -> float | None:
+        try:
+            return float(rates[key]) if key in rates else None
+        except (TypeError, ValueError):
+            return None
+
+    gpus = {name: price for name in KNOWN_GPUS if (price := number(gpu_rate_key(name))) is not None}
+    return ProviderPrices(gpu_hourly=gpus, cpu_core_hourly=number(_RATE_CPU), memory_gib_hourly=number(_RATE_MEMORY))
+
 
 # Python series supported by recent Modal image builders (2024.10 .. 2026.10)
 # that nbgpu offers. Highest preferred when the local version does not fit.
@@ -845,7 +888,7 @@ class _ModalProcess:
 class ModalBackend:
     name = "modal"
     bind_host = "0.0.0.0"
-    capabilities: frozenset[str] = frozenset({CAP_GPU, CAP_VOLUMES, CAP_MAX_RUNTIME, CAP_LIVE_INSTALL})
+    capabilities: frozenset[str] = frozenset({CAP_GPU, CAP_VOLUMES, CAP_MAX_RUNTIME, CAP_LIVE_INSTALL, CAP_BILLING})
 
     def __init__(self, app_name: str = "nbgpu") -> None:
         self.app_name = app_name
@@ -1171,6 +1214,29 @@ class ModalBackend:
         if not isinstance(result, dict):
             raise BackendError(f"Modal: unexpected hash output: {res.stdout[:200]!r}")
         return safe_hash_paths(result)
+
+    def current_prices(self) -> ProviderPrices:
+        import modal
+
+        with _modal_errors("reading this workspace's billing rates"):
+            rates = modal.Workspace.from_context().billing.rates()
+            return prices_from_rates({key: rates.get(key) for key in rates})
+
+    def spend(self, start: datetime, end: datetime, resolution: str) -> list[SpendRow]:
+        import modal
+
+        app_id = self._get_app().app_id
+        with _modal_errors("reading the billing report"):
+            rows = modal.Workspace.from_context().billing.report(start=start, end=end, resolution=resolution)
+        return [
+            SpendRow(
+                interval_start=row.interval_start,
+                cost=float(row.cost),
+                by_resource={str(k): float(v) for k, v in dict(row.cost_by_resource).items()},
+            )
+            for row in rows
+            if row.object_id == app_id
+        ]
 
     def terminate(self, handle: RuntimeHandle) -> None:
         import modal

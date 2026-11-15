@@ -9,13 +9,14 @@ getting the result back as text.
 
 - **`--json` everywhere.** One JSON document on stdout, progress on stderr.
 - **One-line errors**, non-zero exit codes, no tracebacks to wade through.
-- **`nbgpu run` is a function call.** Notebook in, `{exit_code, output}` out.
+- **`nbgpu run` is a function call.** Notebook in, `{exit_code, output, pulled}`
+  out, with the files the run wrote back in the working tree.
 - **Bounded output.** Long logs are cut to their head and tail, with the
   full text in a file the agent can read selectively.
 - **Edits are local.** The agent changes files in the working tree; sync
   moves them. It never needs a shell on the remote machine.
-- **Cost is queryable.** `status --json` reports what is running and what it
-  has cost.
+- **Cost is queryable.** `status --json` reports what is running and its
+  estimated cost; `cost --json` reports what was actually billed.
 
 ## The loop
 
@@ -43,10 +44,11 @@ nbgpu sync train.py --json
 nbgpu stop train.py --json
 ```
 
-`run` inside a session syncs first, so each run sees the agent's latest
-edits without rebuilding anything. `sync` brings back small text files the
-run wrote (`.json`, `.txt`, `.md`, ...; see
-[Sync and conflicts](sync.md#what-comes-back)).
+`run` inside a session syncs first and installs any packages the agent added
+to the header, so each run sees the agent's latest edits without rebuilding
+anything. After the run, small text files it wrote (`.json`, `.txt`, `.md`,
+...) come back on their own; add `--pull 'plots/'` or similar for anything
+else (see [`nbgpu run`](cli.md#nbgpu-run)).
 
 ## Working alongside an agent
 
@@ -63,8 +65,8 @@ Edits you make in the browser arrive in the file the agent reads. If you
 both touch different parts of the file they merge; if you collide, a
 `.remote` copy appears and either of you can resolve it.
 
-With the sync loop running, a dependency the agent adds to the header is
-installed live.
+A dependency the agent adds to the header is installed live by the loop, or
+by the agent's next `nbgpu run` or `nbgpu sync`.
 
 ## Things to tell an agent
 

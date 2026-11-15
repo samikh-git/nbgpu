@@ -25,15 +25,26 @@ python) is fixed for the runtime's life.
 
 The applied state is kept in the session record (extra["env"]), so `nbgpu
 open` resumes from it.
+
+Without a sync loop (`start --detach`, the way agents work), `nbgpu sync`
+and `nbgpu run` call `EnvWatcher.apply()`, which does the same comparison
+and installs synchronously, so a package added to the header is importable
+by the run that follows. A per-session lock file (`<id>.env.lock` in the
+state directory) keeps a loop's background install and a `run`/`sync` from
+installing at the same time; both re-read the applied state from the
+session record after taking it, so whichever comes second sees the first
+one's work and does nothing.
 """
 
 from __future__ import annotations
 
 import collections
+import fcntl
 import json
 import os
 import re
 import threading
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -47,6 +58,55 @@ EXTRA_ENV = "env"
 # interpreter, the one marimo and its kernels run on).
 INSTALL_ARGV = ("uv", "pip", "install", "--system")
 _TAIL_LINES = 8
+# How long `apply()` waits for another install to finish, and for its own.
+INSTALL_TIMEOUT_S = 30 * 60.0
+_LOCK_POLL_S = 0.2
+
+
+class _EnvLock:
+    """An exclusive flock on `<state dir>/<session id>.env.lock`."""
+
+    def __init__(self, store: SessionStore, session_id: str) -> None:
+        self._path = store.directory / f"{session_id}.env.lock"
+        self._fd: int | None = None
+
+    def acquire(self, timeout_s: float = 0.0) -> bool:
+        """True once held; False if another process still holds it after
+        `timeout_s` (0: do not wait)."""
+        if self._fd is not None:
+            return True
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self._path, os.O_RDWR | os.O_CREAT, 0o600)
+        deadline = time.monotonic() + timeout_s
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    os.close(fd)
+                    return False
+                time.sleep(_LOCK_POLL_S)
+            else:
+                self._fd = fd
+                return True
+
+    def release(self) -> None:
+        if self._fd is not None:
+            fd, self._fd = self._fd, None
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+
+@dataclass(frozen=True)
+class Applied:
+    """What `EnvWatcher.apply()` did. Each message starts with a role
+    character (see EnvWatcher.tick). `failed`: an install was attempted and
+    did not succeed, so the runtime lacks something the header lists."""
+
+    messages: list[str]
+    failed: bool = False
 
 
 def _name(requirement: str) -> str:
@@ -144,6 +204,7 @@ class EnvWatcher:
         self._fingerprint: tuple | None = None
         self._install: _Install | None = None
         self._reported: set[str] = set()  # one-off notes already shown
+        self._lock = _EnvLock(store, session.session_id)
         applied = None
         raw = session.extra.get(EXTRA_ENV)
         if raw:
@@ -189,6 +250,24 @@ class EnvWatcher:
             self._reported.add(key)
             messages.append(message)
 
+    def _reload_applied(self) -> None:
+        """Take the applied state from the stored record: another process
+        (`nbgpu run`/`sync`, or a loop) may have installed since."""
+        try:
+            record = self._store.load(self._session.session_id)
+        except (OSError, ValueError):
+            return
+        raw = record.extra.get(EXTRA_ENV) if record is not None else None
+        if not raw:
+            return
+        try:
+            applied = json.loads(raw)
+        except json.JSONDecodeError:
+            return
+        if isinstance(applied, dict):
+            self._applied = applied
+            self._session.extra = {**self._session.extra, EXTRA_ENV: raw}
+
     def _save_applied(self) -> None:
         self._session.extra = {**self._session.extra, EXTRA_ENV: json.dumps(self._applied, sort_keys=True)}
         try:
@@ -208,23 +287,57 @@ class EnvWatcher:
         fingerprint = self._current_fingerprint()
         if fingerprint == self._fingerprint:
             return messages
-        self._fingerprint = fingerprint
-        try:
-            spec = load_spec(self._session.notebook)
-        except SpecError as exc:
-            self._note_once(f"invalid:{exc}", f"!header: {exc}; environment changes are applied once it is valid",
-                            messages)
+        if not self._lock.acquire():
+            # `nbgpu run` or `sync` is installing; look again next tick.
             return messages
-        self._compare(spec, messages)
+        try:
+            self._fingerprint = fingerprint
+            self._reload_applied()
+            try:
+                spec = load_spec(self._session.notebook)
+            except SpecError as exc:
+                self._note_once(f"invalid:{exc}",
+                                f"!header: {exc}; environment changes are applied once it is valid", messages)
+                return messages
+            self._compare(spec, messages)
+        finally:
+            if self._install is None:  # a background install keeps the lock until it ends
+                self._lock.release()
         return messages
 
-    def _compare(self, spec: NotebookSpec, messages: list[str]) -> None:
+    def apply(self, timeout_s: float = INSTALL_TIMEOUT_S) -> Applied:
+        """Bring the runtime in line with the header now, waiting for the
+        install: for `nbgpu sync` and `nbgpu run`, which have no loop. Waits
+        up to `timeout_s` for an install another process is running."""
+        if not self._lock.acquire(timeout_s):
+            return Applied(["!another install into this runtime is still running; "
+                            "dependencies were not checked this time"], failed=True)
+        try:
+            self._reload_applied()
+            try:
+                spec = load_spec(self._session.notebook)
+            except SpecError as exc:
+                return Applied([f"!header: {exc}; environment changes are applied once it is valid"])
+            messages: list[str] = []
+            failed = self._compare(spec, messages, blocking_timeout_s=timeout_s)
+            return Applied(messages, failed)
+        finally:
+            self._lock.release()
+
+    def _compare(self, spec: NotebookSpec, messages: list[str], blocking_timeout_s: float | None = None) -> bool:
+        """Report what changed and install what was added: in the background,
+        or with `blocking_timeout_s` synchronously. Returns True if a
+        synchronous install failed."""
         new = snapshot(spec)
         old_deps: list[str] = list(self._applied.get("deps", []))
         new_deps: list[str] = list(new["deps"])  # type: ignore[arg-type]
 
         old_compute = self._applied.get("compute", {})
         for key, value in dict(new["compute"]).items():  # type: ignore[arg-type]
+            # The header's provider is only a default: --backend or
+            # $NBGPU_BACKEND may have chosen another, and the record holds that.
+            if key == "provider":
+                continue
             if key in old_compute and old_compute[key] != value:
                 self._note_once(
                     f"compute:{key}:{value}",
@@ -243,9 +356,10 @@ class EnvWatcher:
             )
         added = [d for d in new_deps if d not in old_deps]
         if not added:
-            self._applied["deps"] = new_deps
-            self._save_applied()
-            return
+            if new_deps != old_deps:
+                self._applied["deps"] = new_deps
+                self._save_applied()
+            return False
         if CAP_LIVE_INSTALL not in self._backend.capabilities:
             self._note_once(
                 "noinstall:" + ",".join(added),
@@ -253,8 +367,31 @@ class EnvWatcher:
                 "into its runtime: restart the session to apply them",
                 messages,
             )
-            return
-        self._start_install(new_deps, added, messages)
+            return False
+        if blocking_timeout_s is None:
+            self._start_install(new_deps, added, messages)
+            return False
+        return not self._install_now(new_deps, added, messages, blocking_timeout_s)
+
+    def _install_now(self, deps: list[str], added: list[str], messages: list[str], timeout_s: float) -> bool:
+        try:
+            result = self._backend.exec(self._handle, [*INSTALL_ARGV, *deps], cwd=self._handle.remote_root,
+                                        timeout_s=timeout_s)
+        except Exception as exc:  # noqa: BLE001 - reported like a failed install
+            messages.append(f"✗installing {', '.join(added)} failed: {exc}. The runtime's environment is unchanged")
+            return False
+        if result.exit_code == 0:
+            self._applied["deps"] = deps
+            self._save_applied()
+            messages.append(f"✓installed {', '.join(added)} in the runtime")
+            return True
+        lines = (result.stderr + "\n" + result.stdout).splitlines()
+        tail = " | ".join(line.strip() for line in lines[-_TAIL_LINES:] if line.strip())
+        messages.append(
+            f"✗installing {', '.join(added)} failed (exit {result.exit_code}): {tail or 'no output'}. "
+            "The runtime's environment is unchanged; fix the dependencies and try again"
+        )
+        return False
 
     def _start_install(self, deps: list[str], added: list[str], messages: list[str]) -> None:
         proc = self._backend.spawn(self._handle, [*INSTALL_ARGV, *deps], cwd=self._handle.remote_root)
@@ -281,6 +418,7 @@ class EnvWatcher:
         if install.reader is not None:
             install.reader.join(5)
         self._install = None
+        self._lock.release()
         if code == 0:
             self._applied["deps"] = install.deps
             self._save_applied()
@@ -311,6 +449,7 @@ class EnvWatcher:
             except Exception:  # noqa: BLE001
                 pass
             self._install = None
+        self._lock.release()
 
 
 def applied_extra(spec: NotebookSpec) -> Mapping[str, str]:

@@ -6,20 +6,28 @@ document; progress and warnings go to stderr. Errors are one line on stderr
 
 ## Commands
 
-### `nbgpu run NOTEBOOK [--backend NAME] [--max-lines N] [--project-root DIR] [--json]`
+### `nbgpu run NOTEBOOK [--backend NAME] [--max-lines N] [--pull PATTERN]... [--project-root DIR] [--json]`
 
 Runs `python NOTEBOOK` on a runtime and exits with the notebook's exit code.
 Uses the notebook's running session if it has exactly one (and `--backend`,
-if given, matches it, and `--project-root` is not given); otherwise creates a
-one-off runtime, pushes the project, runs, and terminates it.
+if given, matches it, and `--project-root` is not given): syncs, installs
+header changes, runs. Otherwise creates a one-off runtime, pushes the
+project, runs, and terminates it. Either way, after the run one sync pass
+brings back changed files and new small text files, and each `--pull`
+pattern (.gitignore syntax, relative to the project root; up to 200 MB per
+file) brings back other matches.
 
 ```json
-{"exit_code": 0, "output": "stdout then stderr", "truncated": false, "full_output_path": null}
+{"exit_code": 0, "output": "stdout then stderr", "truncated": false, "full_output_path": null,
+ "pulled": ["metrics.json", "plots/loss.png"], "warnings": [], "env": ["installed polars in the runtime"]}
 ```
 
 `truncated: true` means `output` holds the first and last halves of
 `--max-lines` (default 200) around a marker line, and `full_output_path` is a
-local log file with everything.
+local log file with everything. `warnings`: files not brought back (too big,
+unsafe path), sync conflicts, sync errors after the run. `--pull` never
+overwrites a local project file that sync manages. A failed install exits
+non-zero with `nbgpu: error: the notebook was not run: ...`.
 
 ### `nbgpu start NOTEBOOK [--detach] [--gpu G] [--cpu N] [--memory M] [--idle-timeout D] [--max-runtime D] [--backend NAME] [--project-root DIR] [--json]`
 
@@ -35,7 +43,7 @@ second until interrupted (the runtime keeps running after that).
   "runtime_id": "sb-...",
   "url": "https://...?access_token=...",
   "local_url": null,
-  "rate": {"usd_per_hour": 1.1, "complete": true}
+  "rate": {"usd_per_hour": 1.1, "complete": true, "prices_checked": "2026-11-15", "prices_source": "live"}
 }
 ```
 
@@ -43,6 +51,9 @@ second until interrupted (the runtime keeps running after that).
 - `local_url` is the fast localhost proxy; null with `--detach`.
 - `rate` is null when nothing is known about the price; `complete: false`
   means part of the shape (e.g. CPU on an unknown provider) is not priced.
+- `prices_source`: `live` (the account's current rates, refreshed daily),
+  `list` (the built-in table) or `file` (`NBGPU_PRICES`); `prices_checked`:
+  their date. Rates are estimates, not the bill; say so when reporting cost.
 - Flag formats: `--gpu A10G` or `H100:2`; `--memory 32GiB` (a bare number is
   MiB); durations `20m`, `1h30m`, `90s` (a bare number is seconds).
 
@@ -65,6 +76,9 @@ and removes the record. Both print a sync report:
 
 `stop` exits non-zero with open conflicts unless `--force`.
 
+`sync` then installs packages added to the header and adds `"env": [...]`
+with what it did (`installed polars in the runtime`, or why it could not).
+
 ### `nbgpu status [--backend NAME] [--json]`
 
 ```json
@@ -72,7 +86,7 @@ and removes the record. Both print a sync report:
   "sessions": [{
     "session_id": "b390261f", "notebook": "/abs/path/nb.py", "backend": "modal",
     "gpu": "A10G", "running": true, "state": "running", "uptime_s": 312.4,
-    "cost_usd": 0.1, "conflicts": [], "last_sync_at": 1794711155.99,
+    "cost_usd": 0.1, "prices_checked": "2026-11-15", "prices_source": "live", "conflicts": [], "last_sync_at": 1794711155.99,
     "warning": null, "unsynced": []
   }],
   "orphans": [{"backend": "modal", "runtime_id": "sb-...", "uptime_s": 900.0, "session_tag": "..."}],
@@ -91,7 +105,18 @@ and removes the record. Both print a sync report:
 | `not-running` | the runtime is gone; only the record is left | `stop` (clears the record) |
 
 `unsynced` lists remote paths with edits the laptop has not pulled.
-`cost_usd` is null when the rate is unknown.
+`cost_usd` is null when the rate is unknown, and the `prices_*` fields with it.
+
+### `nbgpu cost [--days N] [--backend NAME] [--json]`
+
+What the provider billed for nbgpu's runtimes: the last N complete days
+(default 7, max 31) plus today's complete hours. Not per session (Modal
+bills by App, and nbgpu's runtimes share one). Can lag about an hour.
+
+```json
+{"backend": "modal", "start": "...", "end": "...", "days": [{"date": "2026-11-15", "usd": 0.45}],
+ "by_resource": {"A10G": 0.41, "CPU": 0.03}, "total_usd": 0.46, "prices_refreshed": true, "prices_error": null}
+```
 
 ### `nbgpu stop --orphans [--backend NAME] [--yes] [--json]`
 
@@ -116,6 +141,7 @@ Blocks; run it in the background.
 | `NBGPU_STATE_DIR` | Where session records, tokens and sync state live. Default `$XDG_STATE_HOME/nbgpu`, else `~/.local/state/nbgpu`. |
 | `NBGPU_NO_PROXY` | Any value: do not start the localhost proxy. |
 | `NBGPU_NO_HYPERLINKS` | Any value: plain URLs instead of OSC 8 links. |
+| `NBGPU_PRICES` | Path to a price file replacing the built-in table. |
 | `NO_COLOR` | Any value: no colors. |
 
 ## Limits

@@ -18,7 +18,7 @@ description: Work on the nbgpu codebase itself (this repository). Use when chang
 | `envsync.py` | Live dependency installs and what cannot change in place. |
 | `watchdog.py` | Runs **inside the runtime**; stops marimo when idle. Stdlib only. |
 | `proxy.py` | Localhost proxy serving marimo's static assets from this machine. |
-| `cost.py` | Price table and running totals. |
+| `cost.py` | Price sources in order: `$NBGPU_PRICES`, cached live rates (`prices-live.json` in the state dir), `prices.toml`; rates, running totals, the "as of" disclaimer. |
 | `session.py` | Session records on disk (state directory). |
 | `backends/base.py` | The provider contract (`Backend` protocol). |
 | `backends/modal.py`, `backends/local.py` | Implementations. |
@@ -85,12 +85,27 @@ with `--json`, update the `cli.py` docstring, `docs/cli.md` and
 **A new backend**: implement `Backend` from `backends/base.py`, register it
 in `backends/__init__.py` (`KNOWN_BACKENDS`, lazy import in `get_backend`),
 add it to the contract suite's fixtures in `tests/contract/conftest.py`, add
-prices to `cost.py`. Requirements that are easy to miss: `write_file`'s
+prices to `prices.toml`. Requirements that are easy to miss: `write_file`'s
 check-and-replace must be one step inside the runtime; helper execs must set
 `NBGPU_INTERNAL=1` so the watchdog ignores them; tags must be set atomically
 at creation.
 
-**Prices**: `cost.py`'s table has a `checked` date. Update it with the numbers.
+**Prices**: normally the account's live rates are used: `start` and `cost`
+call `lifecycle.refresh_live_prices`, which on a `billing` backend caches
+`current_prices()` once a day. `src/nbgpu/prices.toml` is the fallback:
+Modal's list prices per second, copied by hand, with a `checked` date. When
+updating it, compare every number with https://modal.com/pricing (or
+`modal.Workspace.from_context().billing.rates()`) and bump `checked` even if
+nothing changed; output says "may be out of date" once it is older than
+`cost.STALE_AFTER_DAYS`. New Modal GPU names need a rate key in
+`backends/modal.py` `_RATE_KEY_ALIASES` unless the key is the name
+lower-cased with `-` as `_`.
+
+**Env installs outside the loop**: `run` and `sync` call
+`EnvWatcher.apply()`, which installs synchronously. The loop's `tick()` and
+`apply()` share a per-session flock (`<id>.env.lock`) and both re-read the
+applied state from the record after taking it; keep that, or a loop and a
+`run` install twice or overwrite each other's record.
 
 ## Trying a change by hand
 

@@ -39,7 +39,8 @@ commands.
 | `envsync.py` | `EnvWatcher`: header changes → live installs or "next start" notes. |
 | `watchdog.py` | Idle detection. Runs on the runtime; standard library only. |
 | `proxy.py` | `LocalProxy`: local static assets, forwarded API and websockets, package-request observation. |
-| `cost.py` | Price table, hourly rate, cost so far. |
+| `cost.py` | Price sources (`NBGPU_PRICES`, cached live rates, `prices.toml`); hourly rate, cost so far. |
+| `prices.toml` | The price table: list prices per second, with the date they were checked. |
 | `session.py` | `Session` records and `SessionStore`. |
 | `backends/base.py` | The `Backend` protocol. |
 | `backends/modal.py` | Modal Sandboxes. |
@@ -63,8 +64,11 @@ A backend provides a small set of operations on a *runtime*:
 | `terminate` | Stop and release |
 
 Optional abilities are declared as capabilities (`gpu`, `volumes`,
-`max-runtime`, `idle-timeout`, `live-install`). A backend that lacks one
-raises `UnsupportedError` for a spec that needs it; nothing is approximated.
+`max-runtime`, `idle-timeout`, `live-install`, `billing`). A backend that
+lacks one raises `UnsupportedError` for a spec that needs it; nothing is
+approximated. `billing` adds two operations: `current_prices()` (the
+account's hourly rates, cached for estimates) and `spend(start, end,
+resolution)` (what this tool's runtimes were billed, for `nbgpu cost`).
 
 Everything else (starting marimo, sync, idle detection, cost) is built on
 these operations, which is what keeps a new provider small.
@@ -139,7 +143,9 @@ timeout then reaps the quiet sandbox if no laptop is around to do it.
 2. Register it in `src/nbgpu/backends/__init__.py`.
 3. Add it to the fixtures in `tests/contract/conftest.py`. The contract suite
    is the definition of correct; a backend passes it unchanged.
-4. Add its prices to `src/nbgpu/cost.py`.
+4. Add its list prices to `src/nbgpu/prices.toml`. If the provider can
+   report prices and spend, add `billing` and implement `current_prices()`
+   and `spend()`.
 
 Points the contract is strict about: `write_file`'s check and replace must
 be one atomic step inside the runtime; tags must be set at creation, not

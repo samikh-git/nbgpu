@@ -76,11 +76,23 @@ warning: installed during the session but not in train.py's dependencies: polars
 
 ## Without a sync loop
 
-Live installs are part of the sync loop. A session started with `--detach`
-and left alone does not get them. `nbgpu open` resumes the loop, and its
-first tick compares the header with what the runtime has, so edits made in
-between are applied then.
+A session started with `--detach` has no loop watching the header. Instead,
+`nbgpu sync` and `nbgpu run` compare the header with what the runtime has
+before doing anything else, and install what was added. They wait for the
+install, so the run that follows can import the package:
 
+```text
+✓ env  installed polars in the runtime
+trained
+```
+
+If the install fails, `run` stops with uv's error instead of running a
+notebook that would fail on the import. Fix the header and run again.
+
+If a sync loop is also running (in another terminal), only one of them
+installs: the other waits and then sees the work is done.
+
+`nbgpu open` resumes the loop, and its first tick does the same comparison.
 A one-off `nbgpu run` builds its runtime from the header as it is at that
 moment, so it always has the current dependencies.
 

@@ -61,7 +61,18 @@ merge by hand, then delete the `.remote` copy.
 
 **A file the notebook wrote does not appear locally**
 New remote files are pulled only if they are small text files. See
-[what comes back](sync.md#what-comes-back). Use a volume for the rest.
+[what comes back](sync.md#what-comes-back). Bring others back with
+`nbgpu run --pull PATTERN`; `warnings` in its output says why a match was
+left out. Use a volume for anything over 200 MB.
+
+**`the notebook was not run: installing ... failed`**
+`nbgpu run` installs packages added to the header before running, and the
+install failed. uv's error is in the message. Fix the requirement and run
+again; the runtime's environment is unchanged.
+
+**`another install into this runtime is still running`**
+A sync loop or another `nbgpu run` is installing into the same session. It
+waits up to 30 minutes; run again once that install finishes.
 
 **A local file is missing on the runtime**
 It is ignored (`.gitignore`, `exclude`), larger than 50 MB, or outside the
@@ -101,6 +112,14 @@ The runtime and record are kept so you can retry. `--force` terminates
 anyway and accepts the loss.
 
 ## Money
+
+**`nbgpu cost` says `cannot report what was billed`**
+The backend has no billing API (the local backend). Use `--backend modal`.
+
+**`could not refresh prices: ...`**
+nbgpu could not read your account's rates. Estimates fall back to the last
+cached rates (up to 7 days old), then to the built-in list prices, and say
+which they used.
 
 **"Is anything still running?"**
 

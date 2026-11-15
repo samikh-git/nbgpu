@@ -550,3 +550,52 @@ def test_cli_run_exit_code_and_output(project: Path, cli_cleanup) -> None:
     assert "line-0000" in out_lines and "line-0999" in out_lines
     assert "line-0500" not in proc.stdout
     assert json_out(nbgpu("status", "--json", cwd=project)) == {"sessions": [], "orphans": [], "other_owners": []}
+
+
+OUTPUT_NOTEBOOK_TEXT = '''\
+import marimo
+
+app = marimo.App()
+
+
+@app.cell
+def _():
+    import json, os
+    os.makedirs("plots", exist_ok=True)
+    os.makedirs("outputs", exist_ok=True)
+    with open("metrics.json", "w") as f:
+        json.dump({"loss": 0.1}, f)
+    with open("plots/curve.png", "wb") as f:
+        f.write(b"\\x89PNG\\x00" + os.urandom(16))
+    with open("outputs/model.bin", "wb") as f:
+        f.write(os.urandom(64))
+    print("trained")
+    return
+
+
+if __name__ == "__main__":
+    app.run()
+'''
+
+
+def test_cli_run_brings_back_what_the_run_wrote(project: Path, notebook: Path, cli_cleanup) -> None:
+    (project / ".gitignore").write_text("outputs/\n")
+    (project / "notebook.py").write_text(OUTPUT_NOTEBOOK_TEXT)
+
+    # One-off: small text files come back by default; --pull brings the rest,
+    # ignored ones included.
+    done = json_out(nbgpu("run", "notebook.py", "--backend", "local", "--json", cwd=project))
+    assert done["exit_code"] == 0 and done["pulled"] == ["metrics.json"]
+    assert not (project / "plots").exists()
+    (project / "metrics.json").unlink()
+    done = json_out(nbgpu("run", "notebook.py", "--backend", "local", "--pull", "plots/", "--pull", "outputs/",
+                          "--json", cwd=project))
+    assert sorted(done["pulled"]) == ["metrics.json", "outputs/model.bin", "plots/curve.png"]
+    first_model = (project / "outputs" / "model.bin").read_bytes()
+
+    # In a session: a run brings back changes to existing outputs, too.
+    json_out(nbgpu("start", "notebook.py", "--backend", "local", "--detach", "--json", cwd=project))
+    done = json_out(nbgpu("run", "notebook.py", "--pull", "outputs/", "--json", cwd=project))
+    assert done["exit_code"] == 0 and done["output"] == "trained"
+    assert {"plots/curve.png", "outputs/model.bin"} <= set(done["pulled"])
+    assert (project / "outputs" / "model.bin").read_bytes() != first_model

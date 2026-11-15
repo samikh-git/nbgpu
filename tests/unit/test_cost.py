@@ -287,3 +287,149 @@ def test_default_prices_give_complete_rate_for_typical_modal_shape() -> None:
     )
     assert rate.usd_per_hour == pytest.approx(expected)
     assert rate.usd_per_hour > 0
+
+
+# --------------------------------------------------------------------------
+# price files: parse_prices, $NBGPU_PRICES, staleness
+# --------------------------------------------------------------------------
+
+import datetime as dt  # noqa: E402
+
+from nbgpu.cost import PRICES_ENV, current_prices, disclaimer, is_stale, parse_prices  # noqa: E402
+
+_PRICE_FILE = """
+checked = "2026-03-01"
+sources = ["https://example.com/pricing"]
+
+[acme]
+cpu-core = 0.0001
+memory-gib = 0.00001
+
+[acme.gpu]
+h100 = 0.001
+"B200+" = 0.002
+"""
+
+
+def test_parse_prices_converts_per_second_to_hourly_and_normalises_gpus() -> None:
+    prices = parse_prices(_PRICE_FILE)
+    assert prices.checked == "2026-03-01"
+    assert prices.source == "https://example.com/pricing"
+    assert prices.gpu_hourly == {("acme", "H100"): pytest.approx(3.6), ("acme", "B200+"): pytest.approx(7.2)}
+    assert prices.cpu_core_hourly["acme"] == pytest.approx(0.36)
+    assert prices.memory_gib_hourly["acme"] == pytest.approx(0.036)
+
+
+def test_parse_prices_accepts_unquoted_toml_date() -> None:
+    assert parse_prices("checked = 2026-03-01\n").checked == "2026-03-01"
+
+
+@pytest.mark.parametrize(
+    ("text", "message"),
+    [
+        ("[acme.gpu]\nT4 = 1\n", "`checked`"),
+        ('checked = "March"\n', "ISO date"),
+        ('checked = "2026-03-01"\n[acme.gpu]\nT4 = -1\n', "acme.gpu.T4"),
+        ('checked = "2026-03-01"\n[acme.gpu]\nT4 = "cheap"\n', "acme.gpu.T4"),
+        ('checked = "2026-03-01"\n[acme]\ncpu = 1\n', "unknown key 'cpu'"),
+        ('checked = "2026-03-01"\ncurrency = "USD"\n', "unknown top-level key"),
+        ("checked = [", "my.toml"),
+    ],
+)
+def test_parse_prices_rejects_malformed_files(text: str, message: str) -> None:
+    with pytest.raises(ValueError, match=message.replace("(", r"\(")):
+        parse_prices(text, "my.toml")
+
+
+def test_shipped_file_is_the_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    from nbgpu.cost import DEFAULT_PRICES
+
+    monkeypatch.delenv(PRICES_ENV, raising=False)
+    assert current_prices() is DEFAULT_PRICES
+    dt.date.fromisoformat(DEFAULT_PRICES.checked)
+
+
+def test_env_override_replaces_the_table(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    path = tmp_path / "prices.toml"
+    path.write_text(_PRICE_FILE)
+    monkeypatch.setenv(PRICES_ENV, str(path))
+    assert hourly_rate(ComputeSpec(provider="acme", gpu="H100:2")).usd_per_hour == pytest.approx(7.2)
+    assert hourly_rate(ComputeSpec(provider="modal", gpu="T4")).complete is False
+
+
+def test_env_override_missing_file_is_an_error(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    monkeypatch.setenv(PRICES_ENV, str(tmp_path / "nope.toml"))
+    with pytest.raises(ValueError, match=PRICES_ENV):
+        current_prices()
+
+
+def test_rate_carries_the_tables_checked_date() -> None:
+    prices = parse_prices(_PRICE_FILE)
+    assert hourly_rate(ComputeSpec(provider="acme", gpu="H100"), prices).prices_checked == "2026-03-01"
+    assert hourly_rate(ComputeSpec(provider="acme", gpu="T4"), prices).prices_checked == "2026-03-01"
+
+
+def test_disclaimer_names_the_date_and_flags_stale_tables() -> None:
+    assert disclaimer("2026-03-01", today=dt.date(2026, 3, 2)) == "estimate from list prices as of 2026-03-01"
+    assert not is_stale("2026-03-01", today=dt.date(2026, 6, 29))
+    assert is_stale("2026-03-01", today=dt.date(2026, 12, 1))
+    assert disclaimer("2026-03-01", today=dt.date(2026, 12, 1)).endswith("; may be out of date")
+    assert disclaimer("") == "estimate from list prices"
+    assert is_stale("not a date")
+
+
+# --------------------------------------------------------------------------
+# live prices
+# --------------------------------------------------------------------------
+
+from nbgpu.backends.base import ProviderPrices  # noqa: E402
+from nbgpu.cost import KIND_FILE, KIND_LIST, KIND_LIVE, LIVE_MAX_AGE_S, save_live_prices  # noqa: E402
+
+
+def test_live_prices_override_the_shipped_ones_they_cover(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from nbgpu.cost import DEFAULT_PRICES
+
+    monkeypatch.delenv(PRICES_ENV, raising=False)
+    save_live_prices(tmp_path, "modal", ProviderPrices({"T4": 0.5, "h100!": 4.0}, 0.15, None), now=1_000_000.0)
+    table = current_prices(tmp_path, now=1_000_000.0 + 60)
+    assert table.kind == KIND_LIVE and table.checked == "1970-01-12"
+    assert table.gpu_hourly[("modal", "T4")] == 0.5
+    assert table.gpu_hourly[("modal", "H100!")] == 4.0  # names normalised
+    assert table.gpu_hourly[("modal", "L4")] == DEFAULT_PRICES.gpu_hourly[("modal", "L4")]  # not covered: shipped
+    assert table.cpu_core_hourly["modal"] == 0.15
+    assert table.memory_gib_hourly["modal"] == DEFAULT_PRICES.memory_gib_hourly["modal"]
+    rate = hourly_rate(ComputeSpec(provider="modal", gpu="T4"), table)
+    assert (rate.prices_source, rate.prices_checked) == (KIND_LIVE, "1970-01-12")
+    assert (tmp_path / "prices-live.json").stat().st_mode & 0o777 == 0o600
+
+
+def test_old_live_prices_are_ignored(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from nbgpu.cost import DEFAULT_PRICES
+
+    monkeypatch.delenv(PRICES_ENV, raising=False)
+    save_live_prices(tmp_path, "modal", ProviderPrices({"T4": 0.5}, None, None), now=0.0)
+    assert current_prices(tmp_path, now=LIVE_MAX_AGE_S + 1) is DEFAULT_PRICES
+
+
+def test_a_broken_live_cache_is_ignored(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from nbgpu.cost import DEFAULT_PRICES
+
+    monkeypatch.delenv(PRICES_ENV, raising=False)
+    (tmp_path / "prices-live.json").write_text("{not json")
+    assert current_prices(tmp_path) is DEFAULT_PRICES
+
+
+def test_the_env_file_beats_live_prices(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    save_live_prices(tmp_path, "acme", ProviderPrices({"H100": 99.0}, None, None))
+    path = tmp_path / "mine.toml"
+    path.write_text(_PRICE_FILE)
+    monkeypatch.setenv(PRICES_ENV, str(path))
+    table = current_prices(tmp_path)
+    assert table.kind == KIND_FILE and table.gpu_hourly[("acme", "H100")] == pytest.approx(3.6)
+
+
+def test_disclaimer_names_the_source() -> None:
+    today = dt.date(2026, 11, 15)
+    assert disclaimer("2026-11-15", KIND_LIVE, today) == "estimate from your account's rates as of 2026-11-15"
+    assert disclaimer("2026-11-15", KIND_LIST, today) == "estimate from list prices as of 2026-11-15"
+    assert disclaimer("2026-01-01", KIND_FILE, today) == "estimate from $NBGPU_PRICES as of 2026-01-01; may be out of date"

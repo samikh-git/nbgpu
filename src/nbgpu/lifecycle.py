@@ -73,6 +73,8 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import datetime
+import hashlib
 import importlib.resources
 import json
 import os
@@ -90,8 +92,19 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import pathspec
+
 from nbgpu import cost, sync, watchdog
-from nbgpu.backends.base import CAP_LIVE_INSTALL, Backend, BackendError, RemoteProcess, RuntimeHandle, RuntimeRequest
+from nbgpu.backends.base import (
+    CAP_BILLING,
+    CAP_LIVE_INSTALL,
+    Backend,
+    BackendError,
+    RemoteProcess,
+    RuntimeHandle,
+    RuntimeRequest,
+    UnsupportedError,
+)
 from nbgpu.cost import Rate
 from nbgpu.session import (
     TAG_NOTEBOOK,
@@ -170,6 +183,8 @@ _EXTRA_SYNC_STATE = "sync_state"
 _EXTRA_RATE = "usd_per_hour"
 _EXTRA_RATE_COMPLETE = "rate_complete"
 _EXTRA_RATE_NOTE = "rate_note"
+_EXTRA_PRICES_CHECKED = "prices_checked"
+_EXTRA_PRICES_SOURCE = "prices_source"
 _EXTRA_STATE = "state"  # STATE_STARTING while a start is in progress
 _EXTRA_KIND = "kind"  # "run" for a one-off run's record
 _EXTRA_OWNER_PID = "owner_pid"  # the process creating (or, for a run, using) the runtime
@@ -255,6 +270,9 @@ class RunResult:
     output: str  # bounded: at most max_output_lines lines
     truncated: bool
     full_output_path: Path | None  # local file holding the full output when truncated
+    pulled: list[str] = field(default_factory=list)  # files brought back after the run
+    warnings: list[str] = field(default_factory=list)  # files not brought back, conflicts, sync errors
+    env: list[str] = field(default_factory=list)  # EnvWatcher messages (role character first)
 
 
 # ---------------------------------------------------------------------------
@@ -563,9 +581,10 @@ def sync_state_path(session_id: str, store: SessionStore) -> Path:
     return store.directory / f"{session_id}.sync.json"
 
 
-def rate_for(compute: ComputeSpec) -> Rate | None:
-    """The hourly rate, or None when the price table knows no prices at all."""
-    prices = cost.DEFAULT_PRICES
+def rate_for(compute: ComputeSpec, state_dir: Path | None = None) -> Rate | None:
+    """The hourly rate, or None when the price table knows no prices at all.
+    `state_dir`: where cached live rates are (see cost.current_prices)."""
+    prices = cost.current_prices(state_dir)
     if not (prices.gpu_hourly or prices.cpu_core_hourly or prices.memory_gib_hourly):
         return None
     return cost.hourly_rate(compute, prices)
@@ -584,6 +603,67 @@ def session_rate(session: Session) -> Rate | None:
         usd_per_hour=usd,
         complete=session.extra.get(_EXTRA_RATE_COMPLETE) == "1",
         note=session.extra.get(_EXTRA_RATE_NOTE, ""),
+        prices_checked=session.extra.get(_EXTRA_PRICES_CHECKED, ""),
+        prices_source=session.extra.get(_EXTRA_PRICES_SOURCE, ""),
+    )
+
+
+def refresh_live_prices(backend: Backend, state_dir: Path, *, force: bool = False) -> str | None:
+    """Cache the provider's current prices (cost.save_live_prices) if the
+    backend can report them and the cache is older than
+    cost.LIVE_REFRESH_AFTER_S (or `force`). Returns an error message, or None
+    (refreshed, fresh enough, or not supported). Never raises for provider
+    errors: prices fall back to the cache or the shipped table."""
+    if CAP_BILLING not in backend.capabilities:
+        return None
+    age = cost.live_cache_age(state_dir, backend.name)
+    if not force and age is not None and 0 <= age < cost.LIVE_REFRESH_AFTER_S:
+        return None
+    try:
+        prices = backend.current_prices()  # type: ignore[attr-defined]
+        cost.save_live_prices(state_dir, backend.name, prices)
+    except Exception as exc:  # noqa: BLE001 - a price refresh never blocks anything
+        return str(exc) or type(exc).__name__
+    return None
+
+
+@dataclass(frozen=True)
+class Spend:
+    days: list[tuple[str, float]]  # (ISO date, USD), oldest first, days with no cost left out
+    by_resource: dict[str, float]  # USD over the period, largest first
+    total: float
+    start: datetime.datetime  # UTC, inclusive
+    end: datetime.datetime  # UTC, exclusive: the end of the last complete hour
+
+
+def spend(backend: Backend, days: int, now: datetime.datetime | None = None) -> Spend:
+    """What this tool's runtimes on `backend` were billed over the last
+    `days` complete UTC days plus today so far (hourly rows, so complete
+    hours only). Raises UnsupportedError without CAP_BILLING."""
+    if CAP_BILLING not in backend.capabilities:
+        raise UnsupportedError(f"the {backend.name} backend cannot report what was billed")
+    if not 1 <= days <= 31:
+        raise ValueError(f"days must be between 1 and 31, got {days}")
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    start = today - datetime.timedelta(days=days)
+    hour = now.replace(minute=0, second=0, microsecond=0)
+    rows = list(backend.spend(start, today, "d"))  # type: ignore[attr-defined]
+    if hour > today:
+        rows += backend.spend(today, hour, "h")  # type: ignore[attr-defined]
+    per_day: dict[str, float] = {}
+    by_resource: dict[str, float] = {}
+    for row in rows:
+        day = row.interval_start.astimezone(datetime.timezone.utc).date().isoformat()
+        per_day[day] = per_day.get(day, 0.0) + row.cost
+        for name, value in row.by_resource.items():
+            by_resource[name] = by_resource.get(name, 0.0) + value
+    return Spend(
+        days=sorted((d, c) for d, c in per_day.items() if c > 0),
+        by_resource=dict(sorted(((k, v) for k, v in by_resource.items() if v > 0), key=lambda kv: -kv[1])),
+        total=sum(per_day.values()),
+        start=start,
+        end=hour,
     )
 
 
@@ -609,6 +689,8 @@ def _rate_extra(rate: Rate | None) -> dict[str, str]:
         _EXTRA_RATE: repr(rate.usd_per_hour),
         _EXTRA_RATE_COMPLETE: "1" if rate.complete else "0",
         _EXTRA_RATE_NOTE: rate.note,
+        _EXTRA_PRICES_CHECKED: rate.prices_checked,
+        _EXTRA_PRICES_SOURCE: rate.prices_source,
     }
 
 
@@ -873,8 +955,12 @@ def _start(
         _EXTRA_UNSYNCED_GRACE: repr(grace_s),
         **({_EXTRA_EXCLUDE: json.dumps(list(spec.exclude))} if spec.exclude else {}),
         **applied_extra(spec),
-        **_rate_extra(rate_for(spec.compute)),
+        **_rate_extra(rate_for(spec.compute, store.directory)),
     }
+    # Fetch the provider's current prices while the runtime is created; the
+    # complete record below is priced with them (at most once a day).
+    price_refresh = threading.Thread(target=refresh_live_prices, args=(backend, store.directory), daemon=True)
+    price_refresh.start()
     session = Session(
         session_id=session_id,
         notebook=notebook,
@@ -943,7 +1029,8 @@ def _start(
 
         session.url = url
         session.token = token
-        session.extra = extra
+        price_refresh.join(timeout=2.0)
+        session.extra = {**extra, **_rate_extra(rate_for(spec.compute, store.directory))}
         store.save(session)
         return session
     except BaseException as exc:
@@ -1295,6 +1382,112 @@ def _bound_output(lines: list[str], max_lines: int, full_output_path: Path) -> s
     return "\n".join([*head, marker, *tail])
 
 
+# Per-file limit for `run --pull`: larger outputs belong on a volume.
+RUN_PULL_MAX_BYTES = 200 * 1024 * 1024
+# At most this many files are pulled by one `run --pull`.
+RUN_PULL_MAX_FILES = 1000
+
+_SIZES_CODE = "import json,os,sys;print(json.dumps({p: os.path.getsize(p) for p in sys.argv[1:] if os.path.isfile(p)}))"
+
+
+def pull_matching(
+    root: Path, backend: Backend, handle: RuntimeHandle, patterns: Sequence[str], exclude: Sequence[str] = ()
+) -> tuple[list[str], list[str]]:
+    """Bring back runtime files matching `patterns` (.gitignore syntax,
+    relative to the project root) that differ from the local copy, for
+    outputs sync would not pull (any type or size, ignored files included).
+
+    A local file that sync manages (exists and is not ignored) is never
+    overwritten: sync handles it both ways. A missing local file is created;
+    an ignored one (an output from an earlier run) is replaced. Files over
+    RUN_PULL_MAX_BYTES, unsafe paths and files changed mid-read are left out
+    with a warning. Returns (pulled, warnings)."""
+    if not patterns:
+        return [], []
+    spec = pathspec.GitIgnoreSpec.from_lines(list(patterns))
+    rules = IgnoreRules(root, exclude)
+    pulled: list[str] = []
+    warnings: list[str] = []
+    candidates: dict[str, str] = {}
+    for rel, digest in sorted(backend.hash_files(handle).items()):
+        if not spec.match_file(rel) or sync.is_excluded(rel):
+            continue
+        target = sync.local_target(root, rel)
+        if target is None:
+            warnings.append(f"{rel}: not pulled (unsafe local path)")
+            continue
+        try:
+            local = target.read_bytes() if target.exists() else None
+        except OSError as exc:
+            warnings.append(f"{rel}: not pulled ({exc.strerror or exc})")
+            continue
+        if local is not None and hashlib.sha256(local).hexdigest() == digest:
+            continue  # already identical
+        if local is not None and not rules.is_ignored(rel):
+            continue  # a synced project file: sync decides, so local edits are never lost
+        candidates[rel] = digest
+    if len(candidates) > RUN_PULL_MAX_FILES:
+        warnings.append(f"{len(candidates)} files match --pull; only the first {RUN_PULL_MAX_FILES} were pulled")
+        candidates = dict(list(candidates.items())[:RUN_PULL_MAX_FILES])
+    if not candidates:
+        return pulled, warnings
+    result = backend.exec(handle, ["python", "-c", _SIZES_CODE, *candidates], cwd=handle.remote_root)
+    try:
+        sizes = json.loads(result.stdout) if result.exit_code == 0 else {}
+    except json.JSONDecodeError:
+        sizes = {}
+    limit_mb = RUN_PULL_MAX_BYTES // (1024 * 1024)
+    for rel, digest in candidates.items():
+        size = sizes.get(rel)
+        if not isinstance(size, int):
+            warnings.append(f"{rel}: not pulled (could not read its size)")
+            continue
+        if size > RUN_PULL_MAX_BYTES:
+            warnings.append(f"{rel}: not pulled ({_size_text(size)} is over the {limit_mb} MB --pull limit; "
+                            "write large outputs to a volume)")
+            continue
+        data = backend.read_file(handle, posixpath.join(handle.remote_root, rel))
+        if data is None or hashlib.sha256(data).hexdigest() != digest:
+            warnings.append(f"{rel}: not pulled (changed or removed while reading)")
+            continue
+        target = sync.local_target(root, rel)
+        if target is None:
+            warnings.append(f"{rel}: not pulled (unsafe local path)")
+            continue
+        sync.write_local_file(target, data)
+        pulled.append(rel)
+    return pulled, warnings
+
+
+def _sync_after_run(
+    engine: SyncEngine, root: Path, backend: Backend, handle: RuntimeHandle, pull: Sequence[str],
+    exclude: Sequence[str], result: RunResult,
+) -> None:
+    """Bring back what the run wrote: one sync pass (small text files, as
+    `nbgpu sync`), then `pull` patterns. Failures become warnings, so the
+    run's own result is never lost."""
+    try:
+        report = engine.poll_once()
+    except Exception as exc:  # noqa: BLE001
+        result.warnings.append(f"syncing after the run failed: {exc}")
+    else:
+        result.pulled.extend(report.pulled + report.merged)
+        result.warnings.extend(f"{c}: sync conflict (remote version saved as a .remote copy)" for c in report.conflicts)
+    try:
+        pulled, warnings = pull_matching(root, backend, handle, pull, exclude)
+    except Exception as exc:  # noqa: BLE001
+        result.warnings.append(f"--pull failed: {exc}")
+    else:
+        result.pulled.extend(p for p in pulled if p not in result.pulled)
+        result.warnings.extend(warnings)
+
+
+def apply_env(session: Session, *, backend: Backend, handle: RuntimeHandle, store: SessionStore) -> envsync.Applied:
+    """Install header changes into the session's runtime now (for `sync` and
+    `run`, which have no loop). See EnvWatcher.apply."""
+    return envsync.EnvWatcher(session, backend, handle, store).apply()
+
+
 def _run_in(
     backend: Backend, handle: RuntimeHandle, rel_notebook: str, max_output_lines: int, output_dir: Path
 ) -> RunResult:
@@ -1328,6 +1521,7 @@ def run(
     output_dir: Path | None = None,
     project_root: Path | None = None,
     store: SessionStore | None = None,
+    pull: Sequence[str] = (),
 ) -> RunResult:
     """Run the whole notebook as a script (`python <notebook>`) on the runtime
     and return its exit code and output. With `session`, sync first and run
@@ -1339,7 +1533,13 @@ def run(
     Output is stdout followed by stderr. output_dir defaults to
     default_state_dir() / "runs". In a session, a run is refused (RunRefused)
     if the notebook has an open sync conflict after syncing. A one-off run
-    keeps a "run" record in `store` (default SessionStore()) while it runs."""
+    keeps a "run" record in `store` (default SessionStore()) while it runs.
+
+    In a session, header changes are installed first (apply_env); a failed
+    install refuses the run, since the notebook would fail on the import.
+    After the run, in both modes, one sync pass brings back what `nbgpu sync`
+    would, and `pull` patterns bring back other outputs (pull_matching);
+    see RunResult.pulled and .warnings."""
     if max_output_lines < 1:
         raise ValueError(f"max_output_lines must be at least 1, got {max_output_lines}")
     out_dir = Path(output_dir) if output_dir is not None else default_state_dir() / "runs"
@@ -1357,7 +1557,20 @@ def run(
                     f"{rel_notebook} has an open sync conflict, so the runtime's copy differs from yours; "
                     "resolve it (delete the .remote copy) and run again"
                 )
-            return _run_in(backend, handle, rel_notebook, max_output_lines, out_dir)
+            env_messages: list[str] = []
+            if store is not None:
+                applied = apply_env(session, backend=backend, handle=handle, store=store)
+                if applied.failed:
+                    detail = "; ".join(m[1:] for m in applied.messages)
+                    raise RunRefused(f"the notebook was not run: {detail}")
+                env_messages = applied.messages
+            result = _run_in(backend, handle, rel_notebook, max_output_lines, out_dir)
+            result.env.extend(env_messages)
+            _sync_after_run(_engine(session, backend, handle, _state_path(session, store)), session.project_root,
+                            backend, handle, pull, session_exclude(session), result)
+            if store is not None:
+                note_synced(session, store)
+            return result
 
         store = store if store is not None else SessionStore()
         spec = load_spec(notebook, overrides)
@@ -1397,8 +1610,11 @@ def run(
             with contextlib.suppress(Exception):
                 store.save(record)
             with tempfile.TemporaryDirectory(prefix="nbgpu-run-") as tmp:
-                _new_engine(root, backend, handle, Path(tmp) / "sync.json", spec.exclude).initial_push()
-            return _run_in(backend, handle, rel_notebook, max_output_lines, out_dir)
+                engine = _new_engine(root, backend, handle, Path(tmp) / "sync.json", spec.exclude)
+                engine.initial_push()
+                result = _run_in(backend, handle, rel_notebook, max_output_lines, out_dir)
+                _sync_after_run(engine, root, backend, handle, pull, spec.exclude, result)
+            return result
         finally:
             _terminate(backend, handle)
             with contextlib.suppress(Exception):

@@ -3,9 +3,10 @@
 ```text
 nbgpu start   NOTEBOOK   start a session, print its URL, keep syncing
 nbgpu open    NOTEBOOK   print a running session's URL, resume syncing
-nbgpu sync    NOTEBOOK   one sync pass
-nbgpu run     NOTEBOOK   run the notebook as a script remotely
+nbgpu sync    NOTEBOOK   one sync pass, then install header changes
+nbgpu run     NOTEBOOK   run the notebook as a script remotely, bring back its files
 nbgpu status             every session, cost so far, untracked runtimes
+nbgpu cost               what the provider actually billed
 nbgpu stop    NOTEBOOK   final pull, terminate, remove the record
 nbgpu stop --orphans     terminate runtimes that lost their record
 ```
@@ -66,13 +67,16 @@ JSON:
   "runtime_id": "sb-...",
   "url": "https://...?access_token=...",
   "local_url": "http://127.0.0.1:2718?access_token=...",
-  "rate": {"usd_per_hour": 1.1, "complete": true}
+  "rate": {"usd_per_hour": 1.1, "complete": true, "prices_checked": "2026-11-15", "prices_source": "live"}
 }
 ```
 
 `local_url` is null when there is no proxy (`--detach`, or `NBGPU_NO_PROXY`).
 `rate` is null when no price is known; `complete: false` means part of the
-shape could not be priced.
+shape could not be priced. `prices_source` says where the prices came from
+(`live`: your account's rates, `list`: the built-in table, `file`:
+`NBGPU_PRICES`) and `prices_checked` how current they are; see
+[Cost](sessions-and-cost.md#cost).
 
 ## `nbgpu open`
 
@@ -100,30 +104,63 @@ One two-way pass. Prints what moved:
 ✗ CONFLICT model.py  (remote version saved next to it as .remote; delete that copy to resolve)
 ```
 
+Then it installs any dependencies added to the header since the runtime last
+had them, and waits for the install:
+
+```text
+✓ env  installed polars in the runtime
+```
+
+This is how a `--detach` session gets header changes. See
+[Environments](environments.md#without-a-sync-loop).
+
 JSON:
 
 ```json
-{"pushed": [], "pulled": [], "merged": [], "conflicts": [], "skipped": [], "warnings": []}
+{"pushed": [], "pulled": [], "merged": [], "conflicts": [], "skipped": [], "warnings": [], "env": []}
 ```
 
 `skipped` lists paths left alone this round: changed while the pass ran, too
 large, unreadable, or unsafe to write. They are retried on the next pass.
+`env` holds the dependency messages, without the symbol.
 
 ## `nbgpu run`
 
 ```text
-nbgpu run NOTEBOOK [--backend NAME] [--max-lines N] [--project-root DIR] [--json]
+nbgpu run NOTEBOOK [--backend NAME] [--max-lines N] [--pull PATTERN]... [--project-root DIR] [--json]
 ```
 
 Runs `python NOTEBOOK` on a runtime, prints its output (stdout, then stderr)
 and exits with the notebook's exit code.
 
-- If the notebook has exactly one running session, the run happens there,
-  after a sync, in a new process next to the marimo kernel.
-- Otherwise a runtime is created for the run and terminated afterwards. In
-  that case only the output comes back; files the run writes do not.
+- If the notebook has exactly one running session, the run happens there:
+  sync, install any header changes, then run in a new process next to the
+  marimo kernel. A failed install stops the run before it starts.
+- Otherwise a runtime is created for the run and terminated afterwards.
 - Giving `--project-root`, or a `--backend` different from the session's,
   forces a one-off runtime.
+
+Afterwards, in both cases, the files the run wrote come back:
+
+- One sync pass brings back what [`nbgpu sync`](sync.md#what-comes-back)
+  would: changes to files you have, and new small text files such as
+  `metrics.json`.
+- `--pull PATTERN` brings back anything else matching the pattern: plots,
+  checkpoints, files in gitignored folders. Patterns use `.gitignore`
+  syntax, relative to the project root (where the run's working directory
+  is): `--pull 'plots/'`, `--pull '*.png'`, `--pull outputs/model.pt`.
+  Repeat the flag for several. Each file may be up to 200 MB; anything
+  bigger belongs on a [volume](notebook-header.md#volumes).
+
+`--pull` never overwrites a project file that sync manages, because that
+could lose local edits; sync handles those. It creates missing files, and
+replaces ignored files from earlier runs.
+
+```text
+trained
+↓ pulled   metrics.json
+↓ pulled   plots/curve.png
+```
 
 Output longer than `--max-lines` (default 200) is shown as its first and last
 halves around a marker line, and written in full to a log file under the
@@ -132,7 +169,47 @@ state directory.
 JSON:
 
 ```json
-{"exit_code": 0, "output": "...", "truncated": false, "full_output_path": null}
+{"exit_code": 0, "output": "...", "truncated": false, "full_output_path": null,
+ "pulled": ["metrics.json", "plots/curve.png"], "warnings": [], "env": []}
+```
+
+`warnings` lists files that matched but were not brought back (too large,
+unsafe path), sync conflicts, and sync errors after the run. None of them
+change the exit code.
+
+## `nbgpu cost`
+
+```text
+nbgpu cost [--days N] [--backend NAME] [--json]
+```
+
+What the provider actually billed for nbgpu's runtimes over the last `N`
+complete days (default 7, at most 31) plus today so far, per day and per
+resource:
+
+```text
+billed for nbgpu's runtimes on modal, 2026-11-08 to 2026-11-15 20:00 UTC:
+  2026-11-14  <$0.01
+  2026-11-15  $0.45
+  total       $0.46
+  by resource: A10G $0.41, CPU $0.03, Memory <$0.01, Network Egress <$0.01
+```
+
+This is the bill, not an estimate, with two limits: it covers complete hours
+only, and the provider's report can lag by an hour or more. `nbgpu status`
+estimates what is running right now. Modal reports cost per App, and all of
+nbgpu's runtimes share one, so the total covers every session rather than
+breaking down by session.
+
+It also refreshes the cached copy of your account's current prices (see
+[Cost](sessions-and-cost.md#cost)).
+
+JSON:
+
+```json
+{"backend": "modal", "start": "2026-11-08T00:00:00+00:00", "end": "2026-11-15T20:00:00+00:00",
+ "days": [{"date": "2026-11-15", "usd": 0.45}], "by_resource": {"A10G": 0.41, "CPU": 0.03},
+ "total_usd": 0.46, "prices_refreshed": true, "prices_error": null}
 ```
 
 ## `nbgpu status`
@@ -164,7 +241,7 @@ JSON:
   "sessions": [{
     "session_id": "b390261f", "notebook": "/abs/path/train.py", "backend": "modal",
     "gpu": "A10G", "running": true, "state": "running", "uptime_s": 742.1,
-    "cost_usd": 0.22, "conflicts": [], "last_sync_at": 1794711155.99,
+    "cost_usd": 0.22, "prices_checked": "2026-11-15", "prices_source": "live", "conflicts": [], "last_sync_at": 1794711155.99,
     "warning": null, "unsynced": []
   }],
   "orphans": [{"backend": "modal", "runtime_id": "sb-...", "uptime_s": 900.0, "session_tag": "..."}],
@@ -216,4 +293,5 @@ other owners are never touched.
 | `NBGPU_STATE_DIR` | Where session records, tokens, sync state and run logs are kept. Default: `$XDG_STATE_HOME/nbgpu`, else `~/.local/state/nbgpu`. Must be outside any project you upload. |
 | `NBGPU_NO_PROXY` | Set to anything to skip the localhost proxy and use the remote URL. |
 | `NBGPU_NO_HYPERLINKS` | Set to anything to print plain URLs instead of clickable terminal links. |
+| `NBGPU_PRICES` | Path to a price file that replaces the built-in one. See [Cost](sessions-and-cost.md#cost). |
 | `NO_COLOR` | Set to anything to turn colors off. |
