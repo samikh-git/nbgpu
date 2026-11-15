@@ -68,11 +68,13 @@ Gaps in what exists today.
   requirement, picking the cheapest available option from the price table.
   More useful once there are several backends.
 
-## Suggested order
+## Priorities
 
-1. Budgets, because they make it safe to let an agent loose with a GPU.
-2. Running code in the live kernel, because re-running the whole notebook is
-   the main reason agent iteration on GPUs is slow.
+Set 2026-11-15:
 
-Both build on parts that already exist: the watchdog for budgets, the proxy's
-connection to marimo for kernel access.
+1. **Run code in the running kernel.** Re-running the whole notebook is the
+   main reason agent iteration on GPUs is slow.
+2. **Choosing the GPU by need** (`gpu = "auto"` plus `gpu-memory`).
+
+Budgets were suggested first, as what makes it safe to leave an agent alone
+with a GPU; they are not in this round.
