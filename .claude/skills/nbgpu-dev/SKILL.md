@@ -17,6 +17,8 @@ description: Work on the nbgpu codebase itself (this repository). Use when chang
 | `ignore.py` | gitignore layering for what is left out of sync. |
 | `envsync.py` | Live dependency installs and what cannot change in place. |
 | `watchdog.py` | Runs **inside the runtime**; stops marimo when idle. Stdlib only. |
+| `kernel.py` | `nbgpu exec`: marimo's kernel API from the laptop; ensure a kernel, run, parse results. |
+| `kernel_runner.py` | Runs **inside the marimo kernel** (sent as code). Stdlib + marimo private APIs only. |
 | `proxy.py` | Localhost proxy serving marimo's static assets from this machine. |
 | `cost.py` | Price sources in order: `$NBGPU_PRICES`, cached live rates (`prices-live.json` in the state dir), `prices.toml`; rates, running totals, the "as of" disclaimer. |
 | `session.py` | Session records on disk (state directory). |
@@ -66,6 +68,12 @@ reason, so do not bind them as default arguments.
   on the state directory's owner id.
 - **Tokens stay out of the project tree**, locally (state dir, 0600) and
   remotely (next to `remote_root`, not in it).
+- **`kernel_runner.py` imports nothing from nbgpu**, defines only
+  `_nbgpu*` names (it runs in the user's kernel namespace), and must never
+  wait inside the kernel for something the kernel itself has to do (a file
+  reload): return `pending` and let `kernel.run_in_kernel` retry.
+- **`exec` leaves no websocket connected.** A connected client makes the
+  user's browser a read-only viewer.
 - **`--json` stdout is one JSON document.** Progress goes to stderr.
 - **Missing capabilities are errors, never approximations** (`UnsupportedError`).
 

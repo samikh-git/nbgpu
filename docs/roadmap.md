@@ -28,12 +28,23 @@ Gaps in what exists today.
 
 ## Agents work inside a live session
 
-- **Run code in the running kernel.** Today an agent can only re-run the
-  whole notebook. Running one cell, or evaluating an expression against live
-  state ("what's the loss so far", "what shape is this tensor"), would let it
-  inspect a model already loaded on the GPU without reloading it. For GPU
-  work that is the difference between seconds and minutes per iteration.
-  Builds on the proxy's existing connection to marimo.
+- ~~**Run code in the running kernel.**~~ Done: `nbgpu exec` evaluates code
+  against the live kernel and runs single cells; see
+  [`nbgpu exec`](cli.md#nbgpu-exec). Findings from the probe (2026-11-15,
+  marimo 0.25.2) that shaped it:
+  - marimo's `POST /api/kernel/execute` (header `Marimo-Stable-Session-Id`,
+    ids from `GET /api/sessions`) runs code in the kernel's scratchpad;
+    `marimo._code_mode` runs cells.
+  - `marimo edit` has no kernel until a client connects; one connection
+    creates it, and the session outlives that client. A client that stays
+    connected makes a later browser read-only, so `exec` connects and leaves.
+  - The kernel applies a reloaded file only between requests, so waiting for
+    a pushed edit is a retry loop on the laptop (about a second locally).
+  - Latency on Modal: about 0.3 s per call over the tunnel.
+  - marimo's own value formatting (HTML, tagged JSON) is not agent-friendly,
+    so the code nbgpu sends computes `repr()` itself.
+  Still open: streaming output of long cells as they run (output arrives at
+  the end, like `run`'s).
 - **An MCP server.** Expose start, run, sync, status, stop and cost as MCP
   tools so agents call them directly instead of shelling out and parsing
   JSON. Guardrails ("ask before anything above $X/h") become part of the
@@ -75,8 +86,7 @@ Gaps in what exists today.
 
 Set 2026-11-15:
 
-1. **Run code in the running kernel.** Re-running the whole notebook is the
-   main reason agent iteration on GPUs is slow.
+1. ~~**Run code in the running kernel.**~~ Done (`nbgpu exec`).
 2. **Choosing the GPU by need** (`gpu = "auto"` plus `gpu-memory`).
 
 Budgets were suggested first, as what makes it safe to leave an agent alone

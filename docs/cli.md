@@ -5,6 +5,7 @@ nbgpu start   NOTEBOOK   start a session, print its URL, keep syncing
 nbgpu open    NOTEBOOK   print a running session's URL, resume syncing
 nbgpu sync    NOTEBOOK   one sync pass, then install header changes
 nbgpu run     NOTEBOOK   run the notebook as a script remotely, bring back its files
+nbgpu exec    NOTEBOOK   run code or cells in the session's live kernel
 nbgpu status             every session, cost so far, untracked runtimes
 nbgpu cost               what the provider actually billed
 nbgpu stop    NOTEBOOK   final pull, terminate, remove the record
@@ -185,6 +186,83 @@ JSON:
 `warnings` lists files that matched but were not brought back (too large,
 unsafe path), sync conflicts, and sync errors after the run. None of them
 change the exit code.
+
+## `nbgpu exec`
+
+```text
+nbgpu exec NOTEBOOK CODE            evaluate CODE in the live kernel
+nbgpu exec NOTEBOOK -f FILE         the code from a file (- for stdin)
+nbgpu exec NOTEBOOK --cell NAME...  run cells and what depends on them
+nbgpu exec NOTEBOOK --all           run every cell
+nbgpu exec NOTEBOOK --list          the cells, with ids and status
+      [--sync | --no-sync] [--max-lines N] [--json]
+```
+
+Works inside the marimo kernel of the notebook's running session, where
+the notebook's variables already are. A model loaded on the GPU stays
+loaded: asking about it takes a fraction of a second instead of re-running
+the notebook. `run`, by contrast, starts a new Python process each time.
+
+```bash
+nbgpu exec train.py "model.config.hidden_size"
+nbgpu exec train.py "losses[-5:]"
+nbgpu exec train.py --cell evaluate
+```
+
+```text
+768
+[0.412, 0.398, 0.391, 0.388, 0.385]
+```
+
+**Evaluating code.** The code runs in marimo's scratchpad, with the
+notebook's variables in scope. If its last statement is an expression,
+`repr()` of the value is printed, the way a Python prompt shows it. `print`
+works as usual, and so does top-level `await`. Errors show a traceback
+with the code's own line numbers and exit 1.
+
+Names the code defines are thrown away afterwards and never become
+notebook variables, but objects it changes in place stay changed:
+`model.eval()` or `history.append(...)` affect the live kernel. To keep
+something, put it in a cell.
+
+**Running cells.** `--cell` takes a cell's function name (`def evaluate():`
+in the file) or its id from `--list`, and is repeatable. marimo then also
+runs the cells that depend on it. Cells above it are not re-run, so an
+edit to the evaluation cell re-evaluates without reloading the model. A
+failing cell prints marimo's traceback and exits 1.
+
+**Your edits.** With `--cell` and `--all`, `exec` syncs first (as `run`
+does), installs header changes, and waits until marimo has loaded the new
+file, about a second, so the cell runs the code you just wrote. A bare
+expression does not sync, which keeps it fast. `--sync` and `--no-sync`
+override either default.
+
+**A kernel that has not run.** Headless marimo starts its kernel only when
+something connects, with every cell unrun. If no cell has run yet, `exec`
+first runs the whole notebook and says so (`ran_notebook`), so the
+variables exist. After that, nothing re-runs unless asked.
+
+**Sharing the kernel.** It is the same kernel the browser shows. A browser
+opened later is a normal editor. While a cell runs in the browser, `exec`
+waits for it. Ctrl-C interrupts the code `exec` started.
+
+JSON:
+
+```json
+{"ok": true, "value": "768", "error": null, "output": "", "truncated": false,
+ "full_output_path": null, "cells": [], "kernel_created": false, "ran_notebook": false,
+ "pushed": [], "warnings": [], "env": []}
+```
+
+`value` is the last expression's `repr()` (null if none). `output` is
+everything printed, stdout and stderr in the order they arrived, bounded
+like `run`'s. `error` is one line when `ok` is false: the exception, or
+`cell NAME: ...` for each failing cell. `cells` lists all cells for `--list`
+(`name`, `id`, `status`, `errors`, `first_line`) and the cells left in an
+error state otherwise. The exit code is 0 when `ok`, else 1.
+
+`exec` needs a running session (`nbgpu start`) and marimo 0.25 or newer,
+which has the kernel execute API it uses.
 
 ## `nbgpu cost`
 

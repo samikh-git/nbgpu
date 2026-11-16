@@ -29,6 +29,34 @@ unsafe path), sync conflicts, sync errors after the run. `--pull` never
 overwrites a local project file that sync manages. A failed install exits
 non-zero with `nbgpu: error: the notebook was not run: ...`.
 
+### `nbgpu exec NOTEBOOK (CODE | -f FILE | --cell NAME... | --all | --list) [--sync | --no-sync] [--max-lines N] [--json]`
+
+Works in the live marimo kernel of the notebook's running session (an error
+without one). CODE (or FILE, `-` for stdin) runs in marimo's scratchpad with
+the notebook's variables in scope; top-level `await` works; names it binds
+are discarded afterwards, in-place mutations persist. `--cell` (function
+name or cell id, repeatable) runs those cells and their dependents; `--all`
+every cell; `--list` runs nothing. If no cell has run in the kernel yet,
+code and cells first run the whole notebook (`ran_notebook`). `--cell` and
+`--all` sync first, install header changes, and wait (up to 15 s) for
+marimo to load a pushed notebook; CODE does not sync unless `--sync`.
+
+```json
+{"ok": true, "value": "repr of the last expression, or null", "error": null,
+ "output": "stdout and stderr in arrival order", "truncated": false, "full_output_path": null,
+ "cells": [{"name": "evaluate", "id": "MJUe", "status": "exception", "errors": ["ValueError: ..."],
+            "first_line": "scores = model(batch)"}],
+ "kernel_created": false, "ran_notebook": false, "pushed": ["nb.py"], "warnings": [], "env": []}
+```
+
+Exit code 0 when `ok`, else 1 (still one JSON document). `error`: the
+exception (`NameError: ...`), `cell NAME: <error>` per failing cell, a
+missing cell name with the named cells listed, or that marimo did not load
+the edit in time. `cells`: every cell for `--list`; otherwise the cells left
+in an error state (statuses: `idle`, `stale`, `exception`, `marimo-error`,
+`cancelled`, `interrupted`, `queued`, `running`, `disabled`). Output is
+bounded like `run`'s. Needs marimo 0.25+ on the runtime.
+
 ### `nbgpu start NOTEBOOK [--detach] [--fresh] [--gpu G] [--cpu N] [--memory M] [--idle-timeout D] [--max-runtime D] [--backend NAME] [--project-root DIR] [--json]`
 
 Creates the runtime, uploads the project, starts marimo, waits until it is

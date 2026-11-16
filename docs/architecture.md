@@ -38,6 +38,8 @@ commands.
 | `ignore.py` | Which paths are left out (gitignore layers + `exclude`). |
 | `envsync.py` | `EnvWatcher`: header changes → live installs or "next start" notes. |
 | `watchdog.py` | Idle detection. Runs on the runtime; standard library only. |
+| `kernel.py` | `nbgpu exec`: reaching the session's live marimo kernel over marimo's HTTP API, creating it when there is none, parsing results. |
+| `kernel_runner.py` | Sent as code into the kernel's scratchpad: evaluates the code or runs cells via `marimo._code_mode`. Imports nothing from nbgpu. |
 | `proxy.py` | `LocalProxy`: local static assets, forwarded API and websockets, package-request observation. |
 | `cost.py` | Price sources (`NBGPU_PRICES`, cached live rates, `prices.toml`); hourly rate, cost so far. |
 | `prices.toml` | The price table: list prices per second, with the date they were checked. |
@@ -124,10 +126,25 @@ which is how UI installs get recorded in the header.
 
 Provider idle timeouts count processes and connections. marimo is always
 running and the sync loop connects every second, so they would never fire.
-The watchdog measures what indicates use (file edits, busy cells, CPU, GPU),
+The watchdog measures what indicates use (file edits, busy cells, CPU, GPU,
+the activity file `nbgpu exec` touches),
 ignores nbgpu's own helper commands (marked with `NBGPU_INTERNAL=1`), and
 stops marimo. It works identically on every backend. Modal's own short idle
 timeout then reaps the quiet sandbox if no laptop is around to do it.
+
+## Talking to the live kernel
+
+`nbgpu exec` calls marimo's own API from the laptop over the session URL
+(`POST /api/kernel/execute`, authenticated with the session token). What it
+sends is `kernel_runner.py`'s source plus one call, so the logic that runs
+inside the kernel (evaluating the last expression, finding cells, checking
+the kernel has loaded the pushed file) is versioned with nbgpu rather than
+depending on marimo's output formatting. Two marimo behaviours shape it:
+headless `marimo edit` has no kernel until a client connects, so `exec`
+connects a websocket once and leaves (a client that stayed would make a
+later browser read-only); and the kernel applies a reloaded file only
+between requests, so waiting for a reload is a retry loop on the laptop,
+not a wait inside the kernel.
 
 ## Security notes
 

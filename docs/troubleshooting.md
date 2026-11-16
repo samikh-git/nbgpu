@@ -75,6 +75,19 @@ is really gone the loop exits and says so.
 Both sides changed the same lines. See [resolving conflicts](sync.md#conflicts):
 merge by hand, then delete the `.remote` copy.
 
+**`nbgpu exec` says `NameError` for a notebook variable**
+The cell that defines it has not run in the kernel, or failed. `nbgpu exec
+NOTEBOOK --list` shows each cell's status; run it with `--cell NAME` or
+everything with `--all`.
+
+**`nbgpu exec --cell` says the kernel did not load the pushed notebook**
+marimo reloads the file when it changes, but cannot when it does not parse.
+Fix the syntax error and run again. The wait is 15 seconds.
+
+**`nbgpu exec` says this marimo has no kernel execute API**
+The runtime has a marimo older than 0.25. Raise `marimo` in the header's
+dependencies, then stop and start the session.
+
 **A file the notebook wrote does not appear locally**
 New remote files are pulled only if they are small text files. See
 [what comes back](sync.md#what-comes-back). Bring others back with

@@ -176,6 +176,30 @@ def test_file_changes_keep_the_session_alive(tmp_path: Path, fake_marimo) -> Non
             wd.wait()
 
 
+def test_the_activity_file_keeps_the_session_alive(tmp_path: Path, fake_marimo) -> None:
+    fake = fake_marimo()
+    activity = tmp_path / "nbgpu-activity"
+    wd = run_watchdog(tmp_path, fake, idle_timeout=1.5, extra=["--activity-file", str(activity)])
+    deadline = time.monotonic() + 4.0
+    try:
+        while time.monotonic() < deadline:
+            activity.touch()  # `nbgpu exec` keeps running code in the kernel
+            time.sleep(0.3)
+            assert wd.poll() is None, "stopped although exec kept touching the activity file"
+        assert not (tmp_path / "nbgpu-idle").exists()
+        wd.wait(timeout=30)  # exec stops: idle after the timeout
+    finally:
+        if wd.poll() is None:
+            wd.kill()
+            wd.wait()
+    assert (tmp_path / "nbgpu-idle").exists()
+
+
+def test_file_mtime_of_a_missing_file_is_none(tmp_path: Path) -> None:
+    assert watchdog.file_mtime(str(tmp_path / "missing")) is None
+    assert watchdog.file_mtime(None) is None
+
+
 def test_cpu_use_keeps_the_session_alive(tmp_path: Path, fake_marimo) -> None:
     fake = fake_marimo(busy_s=3.5)  # "a cell is running" for 3.5s
     started = time.monotonic()

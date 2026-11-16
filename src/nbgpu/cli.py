@@ -32,6 +32,12 @@ non-zero on failure with a one-line error on stderr):
       the notebook's exit code. In a session, header changes are installed
       first. Afterwards one sync pass brings back what `sync` would, and
       --pull brings back other matching outputs (lifecycle.pull_matching).
+  nbgpu exec NOTEBOOK (CODE | -f FILE | --cell NAME... | --all | --list)
+                      [--sync | --no-sync] [--max-lines N]
+      Run code, or cells, in the live marimo kernel of the notebook's session
+      (lifecycle.exec_in_kernel, nbgpu.kernel). Prints the output and the
+      repr of the code's last expression; exits 1 if it failed. --cell and
+      --all sync first by default; CODE does not.
   nbgpu cost [--days N] [--backend NAME]
       What the provider actually billed for nbgpu's runtimes, per day and per
       resource; also refreshes the cached live prices.
@@ -79,6 +85,9 @@ Errors: one line on stderr, no traceback, non-zero exit.
            "total_usd", "prices_refreshed", "prices_error"}
   run:    {"exit_code", "output", "truncated", "full_output_path",
            "pulled" (files brought back after the run), "warnings", "env"}
+  exec:   {"ok", "value", "error", "output", "truncated", "full_output_path",
+           "cells", "kernel_created", "ran_notebook", "pushed", "warnings", "env"}
+           (exit code 0 when ok, else 1, with the document still printed)
 
 Decisions beyond the contract:
 - The chosen backend's name is passed as the spec's `provider` override, so
@@ -920,6 +929,84 @@ def run(notebook: str, backend_name: str | None, max_lines: int, pull: tuple[str
         for warning in result.warnings:
             click.echo(f"{_c('warning:', 'warn')} {warning}", err=True)
     sys.exit(result.exit_code)
+
+
+@main.command(name="exec")
+@click.argument("notebook")
+@click.argument("code", required=False)
+@click.option("-f", "--file", "code_file", type=click.File("r", encoding="utf-8"),
+              help="Read the code from this file (- for stdin).")
+@click.option("--cell", "cells", multiple=True, metavar="NAME",
+              help="Run this cell (name or id) and the cells that depend on it. Repeatable.")
+@click.option("--all", "run_all", is_flag=True, help="Run every cell of the notebook in the kernel.")
+@click.option("--list", "list_cells", is_flag=True, help="List the notebook's cells with their status.")
+@click.option("--sync/--no-sync", "sync_first", default=None,
+              help="Sync first (default: only with --cell/--all, so the kernel runs your current file).")
+@click.option("--max-lines", type=click.IntRange(min=1), default=200, show_default=True, help="Output lines to show.")
+@json_option
+def exec_(notebook: str, code: str | None, code_file: Any, cells: tuple[str, ...], run_all: bool, list_cells: bool,
+          sync_first: bool | None, max_lines: int, as_json: bool) -> None:
+    """Run CODE in the live kernel of NOTEBOOK's session, or run its cells.
+
+    The code sees the notebook's variables (a model already on the GPU
+    stays loaded) and prints the value of its last expression. Names it
+    defines are discarded afterwards; objects it changes in place stay
+    changed. If the session has no kernel yet, one is started and the
+    notebook runs first."""
+    if code_file is not None:
+        if code is not None:
+            raise CliError("give the code either as an argument or with --file, not both")
+        code = code_file.read()
+    chosen = [code is not None, bool(cells), run_all, list_cells]
+    if sum(chosen) != 1:
+        raise CliError("give exactly one of: CODE (or --file), --cell, --all, --list")
+    store = SessionStore()
+    session, backend = _find_session(notebook, store)
+    result = lifecycle.exec_in_kernel(
+        session, backend=backend, store=store, code=code,
+        cells="all" if run_all else (list(cells) if cells else None), list_cells=list_cells,
+        sync_first=sync_first, max_output_lines=max_lines, output_dir=store.directory / "runs",
+    )
+    if as_json:
+        _emit_json({
+            "ok": result.ok,
+            "value": result.value,
+            "error": result.error,
+            "output": result.output,
+            "truncated": result.truncated,
+            "full_output_path": None if result.full_output_path is None else str(result.full_output_path),
+            "cells": result.cells,
+            "kernel_created": result.kernel_created,
+            "ran_notebook": result.ran_notebook,
+            "pushed": result.pushed,
+            "warnings": result.warnings,
+            "env": [m[1:] for m in result.env],
+        })
+        sys.exit(0 if result.ok else 1)
+    for message in result.env:
+        click.echo(_env_line(message), err=True)
+    for path in result.pushed:
+        click.echo(f"{_c('↑ pushed  ', 'ok')} {path}", err=True)
+    if result.ran_notebook:
+        click.echo(_c("· no cell had run in the kernel yet: ran the notebook first", "dim"), err=True)
+    if result.output:
+        click.echo(result.output)
+    if result.truncated:
+        click.echo(_c(f"(output truncated; full output in {result.full_output_path})", "dim"), err=True)
+    if list_cells:
+        width = max((len(str(c.get("name") or "")) for c in result.cells), default=4)
+        for c in result.cells:
+            status = str(c.get("status") or "-")
+            role = "error" if status in ("exception", "marimo-error", "cancelled", "interrupted") else (
+                "warn" if status == "stale" else "dim")
+            click.echo(f"{str(c.get('name') or ''):<{width}}  {_c(str(c.get('id')), 'id')}  "
+                       f"{_c(f'{status:<12}', role)} {_c(str(c.get('first_line') or ''), 'dim')}")
+    elif result.value is not None:
+        click.echo(result.value)
+    for warning in result.warnings:
+        click.echo(f"{_c('warning:', 'warn')} {warning}", err=True)
+    if not result.ok:
+        _fail(result.error or "failed")
 
 
 @main.command()

@@ -15,6 +15,9 @@ active while any of these holds:
   processes alive at both samples count, so short-lived commands such as
   the sync loop's hashing execs do not keep a session alive;
 - a GPU is busy (`nvidia-smi` reports utilization above GPU_BUSY_PERCENT);
+- `--activity-file` was modified recently: `nbgpu exec` touches it from
+  inside the kernel while its code runs, so an agent inspecting a session
+  counts as using it;
 - marimo itself reports a cell running or queued: GET /api/sessions, then
   GET /api/kernel/status (header Marimo-Session-Id) for each session,
   authenticated with `Authorization: Bearer <token>` (`--marimo-url`,
@@ -256,6 +259,15 @@ def marimo_busy(base_url: str, token_file: str) -> bool | None:
         return None
 
 
+def file_mtime(path: str | None) -> float | None:
+    if not path:
+        return None
+    try:
+        return os.stat(path).st_mtime
+    except OSError:
+        return None
+
+
 def newest_mtime(root: str) -> float | None:
     newest: float | None = None
     seen = 0
@@ -473,6 +485,9 @@ def _watch(args: argparse.Namespace, pid: int, grace: float, cache: HashCache) -
             last_active = now
         sample, sample_at = current, mono
         newest = newest_mtime(args.project)
+        touched = file_mtime(args.activity_file)
+        if touched is not None and (newest is None or touched > newest):
+            newest = touched
         if newest is not None:
             last_active = max(last_active, min(newest, now))
         idle_s = now - last_active
@@ -526,6 +541,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--kill-grace", type=float, default=KILL_GRACE_S)
     parser.add_argument("--scope", choices=("all", "tree"), default="all")
     parser.add_argument("--heartbeat", help="rewritten every check while running; removed on exit")
+    parser.add_argument("--activity-file", help="a file whose modification time counts as activity")
     parser.add_argument("--manifest", help="JSON manifest of what the laptop has synced")
     parser.add_argument("--unsynced-marker", help="written while waiting for unsynced edits to be pulled")
     parser.add_argument("--unsynced-grace", type=float, default=UNSYNCED_GRACE_S)

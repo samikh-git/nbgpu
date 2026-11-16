@@ -147,6 +147,8 @@ MARIMO_PIDFILE_NAME = "nbgpu-marimo.pid"
 MANIFEST_NAME = "nbgpu-synced.json"
 UNSYNCED_MARKER_NAME = "nbgpu-idle-unsynced"
 HEARTBEAT_NAME = "nbgpu-watchdog.beat"
+# Touched by `exec` code running in the kernel; the watchdog counts its mtime as activity.
+ACTIVITY_NAME = "nbgpu-activity"
 
 # A terminate that has not finished after this long is given up on (the
 # record is kept), so a network outage cannot hang the CLI.
@@ -817,6 +819,7 @@ def _spawn_watchdog(
         "--manifest", manifest_path(handle),
         "--unsynced-marker", runtime_path(handle, UNSYNCED_MARKER_NAME),
         "--heartbeat", runtime_path(handle, HEARTBEAT_NAME),
+        "--activity-file", runtime_path(handle, ACTIVITY_NAME),
         # Asked from inside the runtime whether a cell is running.
         "--marimo-url", f"http://127.0.0.1:{handle.port_for(MARIMO_PORT)}",
         "--token-file", token_path(handle),
@@ -1849,3 +1852,121 @@ def run(
             _terminate(backend, handle)
             with contextlib.suppress(Exception):
                 store.remove(run_id)
+
+
+# ---------------------------------------------------------------------------
+# exec: code in the live kernel
+
+
+@dataclass
+class KernelExecResult:
+    ok: bool
+    value: str | None  # repr() of the code's last expression, if any
+    error: str | None  # one line, when not ok
+    output: str  # stdout and stderr in arrival order, bounded like run's
+    truncated: bool
+    full_output_path: Path | None
+    cells: list[dict[str, object]] = field(default_factory=list)  # --list: all; cells: those in error
+    kernel_created: bool = False  # no kernel existed; exec started one
+    ran_notebook: bool = False  # ... and ran every cell first
+    pushed: list[str] = field(default_factory=list)  # files pushed by the sync before
+    warnings: list[str] = field(default_factory=list)
+    env: list[str] = field(default_factory=list)  # EnvWatcher messages (role character first)
+
+
+def exec_in_kernel(
+    session: Session,
+    *,
+    backend: Backend,
+    store: SessionStore,
+    code: str | None = None,
+    cells: Sequence[str] | str | None = None,
+    list_cells: bool = False,
+    sync_first: bool | None = None,
+    max_output_lines: int = 200,
+    output_dir: Path | None = None,
+) -> KernelExecResult:
+    """Run `code` in the session's live marimo kernel (exactly one of `code`,
+    `cells` (names or ids, or "all"), `list_cells`), see nbgpu.kernel.
+
+    sync_first (default: only when running cells) does one sync pass first,
+    refuses if the notebook has a conflict, and installs header changes, as
+    `run` does; when it pushed the notebook, cells run only once marimo's
+    file watcher has loaded it. Without a kernel, one is started. Unless only
+    listing, if no cell has run in the kernel yet, every cell runs first so
+    the notebook's variables exist (ran_notebook).
+    Output is bounded like run's (full text under output_dir)."""
+    from nbgpu import kernel as kernel_mod
+
+    modes = [code is not None, cells is not None, list_cells]
+    if sum(modes) != 1:
+        raise ValueError("exactly one of code, cells and list_cells is needed")
+    out_dir = Path(output_dir) if output_dir is not None else default_state_dir() / "runs"
+    rel_notebook = _relative_notebook(session.notebook, session.project_root)
+    remote_notebook = posixpath.join(session.remote_root, rel_notebook)
+    activity = posixpath.join(posixpath.dirname(session.remote_root), ACTIVITY_NAME)
+    result = KernelExecResult(ok=False, value=None, error=None, output="", truncated=False, full_output_path=None)
+
+    do_sync = sync_first if sync_first is not None else cells is not None
+    notebook_pushed = False
+    if do_sync:
+        handle = _require_handle(session, backend)
+        report = _engine(session, backend, handle, _state_path(session, store)).poll_once()
+        note_synced(session, store)
+        if rel_notebook in report.conflicts:
+            raise RunRefused(
+                f"{rel_notebook} has an open sync conflict, so the runtime's copy differs from yours; "
+                "resolve it (delete the .remote copy) and run again"
+            )
+        result.pushed = list(report.pushed)
+        result.warnings.extend(report.warnings)
+        notebook_pushed = rel_notebook in report.pushed or rel_notebook in report.merged
+        applied = apply_env(session, backend=backend, handle=handle, store=store)
+        if applied.failed:
+            detail = "; ".join(m[1:] for m in applied.messages)
+            raise RunRefused(f"nothing was run: {detail}")
+        result.env = applied.messages
+
+    pieces: list[str] = []
+
+    def collect(channel: str, text: str) -> None:
+        pieces.append(text)
+
+    client = kernel_mod.KernelClient(session.url, session.token)
+    try:
+        session_id, created = client.ensure_kernel(rel_notebook)
+    except kernel_mod.KernelError:
+        _require_handle(session, backend)  # a runtime that is gone is the better error
+        raise
+    result.kernel_created = created
+    params: dict[str, object] = {"activity": activity, "prime": True}
+    if list_cells:
+        params["mode"] = "list"
+    elif code is not None:
+        params.update(mode="code", code=code)
+    else:
+        params.update(mode="cells", cells="all" if cells == "all" else list(cells or ()))
+        if notebook_pushed and not created:  # a new kernel read the current file
+            params["wait_for"] = remote_notebook
+    outcome = kernel_mod.run_in_kernel(client, session_id, params, collect)
+    result.ok, result.value, result.error, result.cells = outcome.ok, outcome.value, outcome.error, outcome.cells
+    result.ran_notebook = outcome.ran_notebook
+    if outcome.notebook_error and code is not None:
+        result.warnings.append(f"running the notebook first: {outcome.notebook_error}")
+
+    text = kernel_mod.strip_results("".join(pieces))[0].rstrip("\n")
+    lines = text.split("\n") if text else []
+    if len(lines) <= max_output_lines:
+        result.output = text
+        return result
+    if not out_dir.exists():
+        ensure_private_dir(out_dir)
+    stem = posixpath.splitext(posixpath.basename(rel_notebook))[0]
+    fd, name = tempfile.mkstemp(prefix=f"{stem}-exec-{time.strftime('%Y%m%d-%H%M%S')}-", suffix=".log", dir=out_dir)
+    with open(fd, "w", encoding="utf-8") as f:
+        os.fchmod(f.fileno(), 0o600)
+        f.write(text)
+    result.full_output_path = Path(name)
+    result.truncated = True
+    result.output = _bound_output(lines, max_output_lines, result.full_output_path)
+    return result

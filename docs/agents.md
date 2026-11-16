@@ -11,6 +11,8 @@ getting the result back as text.
 - **One-line errors**, non-zero exit codes, no tracebacks to wade through.
 - **`nbgpu run` is a function call.** Notebook in, `{exit_code, output, pulled}`
   out, with the files the run wrote back in the working tree.
+- **`nbgpu exec` is a REPL on the GPU.** An expression or a cell in,
+  `{ok, value, output}` out, against the live kernel's state.
 - **Bounded output.** Long logs are cut to their head and tail, with the
   full text in a file the agent can read selectively.
 - **Edits are local.** The agent changes files in the working tree; sync
@@ -50,6 +52,23 @@ anything. After the run, small text files it wrote (`.json`, `.txt`, `.md`,
 ...) come back on their own; add `--pull 'plots/'` or similar for anything
 else (see [`nbgpu run`](cli.md#nbgpu-run)).
 
+Without reloading, when the slow part is loading a model or a dataset:
+
+```bash
+nbgpu exec train.py --cell evaluate --json
+```
+
+```bash
+nbgpu exec train.py "confusion[:3]" --json
+```
+
+`exec` works in the session's live kernel. The agent edits a cell in the
+file and runs just that cell; the model loaded above it stays on the GPU.
+It can also evaluate expressions against what is in memory. Each call takes
+a fraction of a second plus the cell's own time. A final
+`nbgpu run --json` confirms the result from a clean process. See
+[`nbgpu exec`](cli.md#nbgpu-exec).
+
 ## Working alongside an agent
 
 The arrangement nbgpu is built for: you have the notebook open in the
@@ -67,6 +86,11 @@ both touch different parts of the file they merge; if you collide, a
 
 A dependency the agent adds to the header is installed live by the loop, or
 by the agent's next `nbgpu run` or `nbgpu sync`.
+
+The agent's `nbgpu exec` calls run in the same kernel as your tab, so cells
+it runs update there too. Its expressions can read your variables, and
+in-place changes it makes to them are real. The bundled skill tells it to
+ask before mutating state you are working with.
 
 ## Things to tell an agent
 

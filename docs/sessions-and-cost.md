@@ -55,6 +55,7 @@ actually doing. The session is active while any of these holds:
   wait on a network call without using CPU)
 - processes on the runtime are using CPU
 - the GPU is in use
+- `nbgpu exec` is running code in the kernel, or ran some recently
 
 An open browser tab is not activity. nbgpu's own sync traffic is not
 activity either.

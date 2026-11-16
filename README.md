@@ -17,6 +17,7 @@ syncs the project both ways, and serves the marimo UI on a local URL.
 ```bash
 nbgpu start train.py     # opens marimo on an A10G; edits sync both ways
 nbgpu run train.py       # or: run it as a script remotely; output and files come back
+nbgpu exec train.py "model.device"   # ask the live kernel; the model stays loaded
 nbgpu stop train.py      # pull, terminate, stop paying
 ```
 
@@ -55,7 +56,9 @@ modal setup
   was actually billed in `cost`, and an idle watchdog stops sessions nobody
   is using. Runtimes that lost their record are found and listed.
 - **Built for agents.** Every command has `--json`, errors are one line, and
-  `nbgpu run` turns a notebook into a remote script with an exit code.
+  `nbgpu run` turns a notebook into a remote script with an exit code, and
+  `nbgpu exec` runs an expression or one cell against the live kernel, so a
+  model on the GPU is inspected without being reloaded.
 
 ## Documentation
 

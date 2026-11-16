@@ -5,6 +5,10 @@ Match the one-line error on stderr against the left column.
 | Error contains | Cause | Fix |
 |----------------|-------|-----|
 | `no session for ...` | `sync`/`open`/`stop` on a notebook that has no session | `nbgpu start`, or use `nbgpu run` for a one-off |
+| `no kernel execute API` | `exec` against a marimo older than 0.25 on the runtime | Raise marimo in the header's dependencies, then stop and start |
+| `did not load the pushed notebook` | `exec --cell` pushed an edit marimo could not load (often a syntax error) | `python -c "import ast; ast.parse(open('nb.py').read())"`, fix, run again |
+| `no cell named ...` | `exec --cell` with a name that is not a cell function name | `nbgpu exec nb.py --list --json`; use a listed name or id |
+| `NameError` from `exec` right after an edit | The name is defined in a cell that has not been re-run | `exec --cell` that cell, or `--all` |
 | `already has a running session` | `start` on a notebook that is already up | Reuse it: `nbgpu run` / `nbgpu sync`; or `nbgpu stop` first |
 | `N sessions are running for ...` | Duplicate sessions for one notebook | `nbgpu stop NOTEBOOK` until one is left |
 | `unknown key '...' under [tool.nbgpu]` | Typo in the header (e.g. `gpus`) | Fix the key; the message lists the known ones |

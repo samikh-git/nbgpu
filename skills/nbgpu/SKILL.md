@@ -21,6 +21,7 @@ A running runtime costs money until it is stopped. Whatever else happens,
 |------|---------|--------------|
 | Run the notebook once, get output and files | `nbgpu run nb.py --json` (add `--pull 'plots/'` etc. for outputs) | Creates a runtime, runs, brings files back, terminates it. Nothing left behind. |
 | Iterate (edit, run, edit, run) | `nbgpu start nb.py --detach --json`, then `nbgpu run nb.py --json` repeatedly, then `nbgpu stop nb.py --json` | One runtime billed from start to stop; each run skips provisioning. |
+| Iterate on later cells while an expensive one (model load, data prep) stays in memory | `nbgpu start nb.py --detach --json`, then `nbgpu exec nb.py --cell NAME --json` and `nbgpu exec nb.py "EXPR" --json` | Same runtime cost; each step takes seconds, because nothing above the cell re-runs. |
 | The user wants the marimo UI | `nbgpu start nb.py` in the background (it never returns: it is the sync loop) | Billed until `nbgpu stop`, or the idle timeout. |
 
 Prefer the one-off `run` unless you expect three or more runs, or provisioning
@@ -55,6 +56,44 @@ dependency order. What comes back:
   fresh Python process each time: no state carries over from the previous
   run or from the marimo kernel in the browser, and it shares the GPU with
   that kernel.
+
+## Working in the live kernel
+
+`nbgpu exec` works inside the session's marimo kernel, where the notebook's
+variables already exist, the same kernel the user sees in the browser. Use
+it when re-running the whole notebook is the slow part: a model loaded on
+the GPU, a large dataset in memory.
+
+```bash
+nbgpu exec nb.py "model.device, sum(p.numel() for p in model.parameters())" --json
+nbgpu exec nb.py --list --json            # cell names, ids, status
+nbgpu exec nb.py --cell evaluate --json   # after editing that cell locally
+```
+
+```json
+{"ok": true, "value": "(device(type='cuda', index=0), 124439808)", "error": null,
+ "output": "", "cells": [], "ran_notebook": false, "pushed": [], ...}
+```
+
+- `value` is `repr()` of the code's last expression; `output` is what was
+  printed. `ok: false` comes with `error` and a traceback in `output`, and
+  exit code 1.
+- Code runs in a scratchpad: names it defines are discarded after each
+  call. Objects it changes in place stay changed in the user's kernel
+  (`model.train()`, `.append`, `del`, moving tensors), so inspect freely but
+  ask before mutating state the user is working with. To keep a result, put
+  it in a cell in the file and run that cell.
+- `--cell NAME` (the cell's function name, or an id from `--list`)
+  syncs first, waits for marimo to load your edit, then runs that cell and
+  the cells that depend on it. Cells above it keep their state. Edit cells
+  in the local file, never through `exec`.
+- The first `exec` on a kernel where no cell has run runs the whole notebook
+  first (`ran_notebook: true`), so expect the notebook's full run time once.
+- A kernel's state can drift from the file (in-place changes, cells run in
+  a different order). Before reporting a result as final, confirm it with a
+  clean `nbgpu run nb.py --json`.
+- `exec` counts as activity for the idle watchdog. It needs a running
+  session; there is no one-off form.
 
 ## Getting results back
 
