@@ -1,0 +1,111 @@
+# nbgpu
+
+Run a local [marimo](https://marimo.io) notebook on a remote GPU. The notebook
+declares the compute it needs in its own header; `nbgpu start` provisions it,
+syncs the project both ways, and serves the marimo UI on a local URL.
+
+```python
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["marimo", "torch"]
+#
+# [tool.nbgpu]
+# gpu = "A10G"
+# ///
+```
+
+```bash
+nbgpu start train.py     # opens marimo on an A10G; edits sync both ways
+nbgpu run train.py       # or: run it as a script remotely; output and files come back
+nbgpu exec train.py "model.device"   # ask the live kernel; the model stays loaded
+nbgpu stop train.py      # pull, terminate, stop paying
+```
+
+The notebook stays a plain Python file on your machine, in your git repo,
+editable by you, your editor and your agents. Only the kernel is remote.
+
+## Install
+
+With Homebrew (macOS or Linux):
+
+```bash
+brew install samikh-git/tools/nbgpu
+```
+
+Or with [uv](https://docs.astral.sh/uv/), from a checkout (Python 3.11+):
+
+```bash
+uv tool install --editable .
+```
+
+Sync needs `git` on your `PATH` (for three-way merges). Then log in to
+[Modal](https://modal.com) once:
+
+```bash
+modal setup
+```
+
+## What it does
+
+- **Compute in the header.** GPU, CPU, memory, volumes and timeouts live next
+  to the dependencies in the notebook's PEP 723 block.
+- **Two-way sync.** Local edits are pushed, edits made in the marimo UI are
+  pulled, concurrent edits are merged three-way, and a real conflict leaves
+  both versions on disk. Nothing is ever overwritten unseen.
+- **Live environments.** Add a dependency to the header and it is installed
+  in the running session; install one from marimo's UI and it is written
+  back to the header.
+- **Cost stays visible and bounded.** The hourly rate (from your account's
+  current prices) is printed at start, the running total in `status`, what
+  was actually billed in `cost`, and an idle watchdog stops sessions nobody
+  is using. Runtimes that lost their record are found and listed.
+- **Built for agents.** Every command has `--json`, errors are one line, and
+  `nbgpu run` turns a notebook into a remote script with an exit code, and
+  `nbgpu exec` runs an expression or one cell against the live kernel, so a
+  model on the GPU is inspected without being reloaded.
+
+## Documentation
+
+| | |
+|---|---|
+| [Getting started](docs/getting-started.md) | Install, first session, first run |
+| [Notebook header](docs/notebook-header.md) | Every `[tool.nbgpu]` key |
+| [CLI reference](docs/cli.md) | Commands, flags, JSON output, environment variables |
+| [Sync and conflicts](docs/sync.md) | What moves, what does not, resolving conflicts |
+| [Environments](docs/environments.md) | Dependencies, live installs, Python version |
+| [Sessions, idle and cost](docs/sessions-and-cost.md) | Lifecycle, idle shutdown, orphans, pricing |
+| [Warm starts](docs/warm-starts.md) | The cache volume, filesystem snapshots, start timings |
+| [Using nbgpu with agents](docs/agents.md) | The agent loop and the bundled skills |
+| [Architecture](docs/architecture.md) | How the pieces fit; adding a backend |
+| [Roadmap](docs/roadmap.md) | Where it could go next |
+| [Troubleshooting](docs/troubleshooting.md) | Errors and what to do about them |
+
+## Agent skills
+
+Two skills ship with the package, and a third with this repository:
+
+| Skill | For |
+|-------|-----|
+| [`nbgpu`](src/nbgpu/skills/nbgpu/SKILL.md) | Running notebooks remotely: modes, results, cost, conflicts |
+| [`nbgpu-notebook`](src/nbgpu/skills/nbgpu-notebook/SKILL.md) | Writing notebooks and headers that work remotely and in script mode |
+| [`nbgpu-dev`](.claude/skills/nbgpu-dev/SKILL.md) | Working on nbgpu itself |
+
+All three are active in this repository as-is. To use the first two in every
+project:
+
+```bash
+nbgpu skills install     # copies them into ~/.claude/skills
+```
+
+See [Using nbgpu with agents](docs/agents.md#installing-the-skills).
+
+## Development
+
+```bash
+uv sync
+uv run pytest                 # unit, contract (local backend) and e2e tests
+NBGPU_MODAL_TESTS=1 uv run pytest -m modal   # creates real Modal sandboxes
+```
+
+The kernel-tunnel prototype for VS Code lives in [`shim/`](shim/README.md).
+It is a separate experiment and not used by `nbgpu`.

@@ -1,0 +1,73 @@
+[project]
+name = "nbgpu"
+dynamic = ["version"]
+description = "Run local marimo notebooks on remote GPUs"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Sami Houssaini" }]
+requires-python = ">=3.11"
+keywords = ["marimo", "notebook", "gpu", "modal", "remote"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+]
+dependencies = [
+  "aiohttp>=3.9",
+  "click>=8.1",
+  # The laptop serves marimo's frontend to the browser (nbgpu.proxy) and pins
+  # the runtime's marimo to the same version.
+  "marimo==0.25.2",
+  "modal>=1.6",
+  "pathspec>=0.12",
+]
+
+[project.urls]
+Homepage = "https://github.com/samikh-git/nbgpu"
+Documentation = "https://github.com/samikh-git/nbgpu/tree/main/docs"
+Issues = "https://github.com/samikh-git/nbgpu/issues"
+
+[project.scripts]
+nbgpu = "nbgpu.cli:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8",
+  "pytest-timeout>=2.3",
+]
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/nbgpu/__init__.py"
+
+[tool.hatch.build.targets.sdist]
+only-include = [
+  "src/nbgpu",
+  "tests",
+  "docs",
+  "README.md",
+  "LICENSE",
+  "pyproject.toml",
+  "uv.lock",
+]
+exclude = ["__marimo__", "__pycache__"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nbgpu"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+timeout = 120
+markers = [
+  "e2e: starts real marimo processes through the local backend (slower)",
+  "modal: creates real Modal sandboxes; skipped unless NBGPU_MODAL_TESTS=1",
+]
