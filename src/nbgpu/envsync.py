@@ -172,6 +172,7 @@ def snapshot(spec: NotebookSpec) -> dict[str, object]:
         "compute": {
             "gpu": c.gpu, "cpu": c.cpu, "memory_mib": c.memory_mib,
             "volumes": dict(c.volumes), "python": spec.requires_python, "provider": c.provider,
+            "cache": c.cache_volume, "cell-cache": spec.cell_cache,
         },
     }
 

@@ -90,6 +90,22 @@ full reference). To add a package, edit `dependencies` in the header; do not
 `--gpu`, `--cpu`, `--memory`, `--idle-timeout`, `--max-runtime` on `start`
 override the header for one session without editing the file.
 
+## Warm starts
+
+- Model weights, `torch.hub`, compile caches and uv downloads go to a cache
+  volume kept between sessions (`HF_HOME` etc. point there; `$NBGPU_CACHE`
+  is the mount for anything else). No action needed; the second session
+  skips the downloads.
+- After installing packages live in a long session, `nbgpu stop nb.py
+  --snapshot --json` saves the runtime's disk; the next `start` boots from
+  it in seconds instead of rebuilding the image (`from_snapshot` in its
+  JSON). `start --fresh` ignores it. The kernel's memory is never kept.
+- Blocks wrapped in `mo.persistent_cache` are restored instead of
+  recomputed in later sessions only if the header has `cell-cache = true`
+  (opt-in; do not add it unasked). See the `nbgpu-notebook` skill.
+- `start --json` reports `timings` (create, upload, ready, total) if the
+  user asks why starting is slow.
+
 ## Cost and cleanup
 
 - `start --json` reports `rate.usd_per_hour`; `status --json` reports

@@ -35,9 +35,12 @@ non-zero on failure with a one-line error on stderr):
   nbgpu cost [--days N] [--backend NAME]
       What the provider actually billed for nbgpu's runtimes, per day and per
       resource; also refreshes the cached live prices.
-  nbgpu stop NOTEBOOK [--force]
+  nbgpu stop NOTEBOOK [--force] [--snapshot | --no-snapshot]
       Final pull, terminate, remove the record. --force: stop despite open
-      conflicts, and terminate even if the final pull fails.
+      conflicts, and terminate even if the final pull fails. --snapshot
+      (default: the header's `snapshot`) saves the runtime's filesystem first;
+      the next `start` boots from it if the environment still matches
+      (`start --fresh` builds instead).
   nbgpu stop --orphans [--backend NAME] [--yes]
       List untracked runtimes of this state directory and terminate them
       (after a confirmation unless --yes; --json requires --yes). Runtimes of
@@ -54,7 +57,8 @@ Errors: one line on stderr, no traceback, non-zero exit.
 --json shapes:
   start:  {"session_id", "notebook", "backend", "runtime_id",
            "url" (includes access_token), "local_url" (when the proxy runs),
-           "rate": null | {"usd_per_hour", "complete", "prices_checked", "prices_source"}}
+           "rate": null | {"usd_per_hour", "complete", "prices_checked", "prices_source"},
+           "from_snapshot": null | image id, "timings": {"create", "upload", "ready", "total"}}
   status: {"sessions": [{"session_id", "notebook", "backend", "gpu", "running",
            "state", "uptime_s", "cost_usd", "prices_checked" (ISO date) and
            "prices_source" ("live", "list" or "file"; both null when cost_usd
@@ -67,6 +71,7 @@ Errors: one line on stderr, no traceback, non-zero exit.
   never reads prices, so a broken $NBGPU_PRICES cannot hide what is billing.
   `cost` reports what the provider actually billed (CAP_BILLING).
   sync, stop: {"pushed", "pulled", "merged", "conflicts", "skipped", "warnings"}
+           (stop also "snapshot": null | {"image", "created_at", "seconds", ...})
            (sync also "env": header changes installed or reported)
   stop --orphans: {"orphans": [...], "terminated": [ids], "skipped": [ids],
            "failed": {id: error}}
@@ -224,6 +229,8 @@ def _session_json(session: Session, proxy: LocalProxy | None = None) -> dict[str
         "url": session.url_with_token(),
         "local_url": proxy.url_with_token(session.token) if proxy is not None else None,
         "rate": _rate_json(lifecycle.session_rate(session)),
+        "from_snapshot": lifecycle.session_snapshot(session),
+        "timings": lifecycle.session_timings(session) or None,
     }
 
 
@@ -601,6 +608,7 @@ def main() -> None:
 @click.option("--max-runtime", help='e.g. "8h" (plain numbers are seconds).')
 @project_root_option
 @click.option("--detach", is_flag=True, help="Return once marimo is ready instead of syncing.")
+@click.option("--fresh", is_flag=True, help="Build the environment even if a snapshot of it was saved.")
 @json_option
 def start(
     notebook: str,
@@ -612,6 +620,7 @@ def start(
     max_runtime: str | None,
     project_root: Path | None,
     detach: bool,
+    fresh: bool,
     as_json: bool,
 ) -> None:
     """Start a session for NOTEBOOK."""
@@ -643,7 +652,7 @@ def start(
             _say(f"  {_c(f'{time.monotonic() - started:5.1f}s', 'dim')}  {message}", err=True)
 
     session = lifecycle.start(spec.path, backend=backend, store=store, overrides={**overrides, "provider": name},
-                              project_root=project_root, progress=progress)
+                              project_root=project_root, progress=progress, fresh=fresh)
     if not as_json:
         _say(f"  {_c(f'{time.monotonic() - started:5.1f}s', 'dim')}  ready", err=True)
     packages: queue.Queue = queue.Queue()
@@ -919,8 +928,12 @@ def run(notebook: str, backend_name: str | None, max_lines: int, pull: tuple[str
 @click.option("--orphans", is_flag=True, help="Terminate runtimes this tool created that no session record tracks.")
 @click.option("--backend", "backend_name", help="With --orphans: only look on this backend.")
 @click.option("--yes", is_flag=True, help="With --orphans: do not ask for confirmation.")
+@click.option("--snapshot/--no-snapshot", default=None,
+              help="Save the runtime's filesystem so the next start resumes from it (default: the header's "
+                   "`snapshot` key).")
 @json_option
-def stop(notebook: str | None, force: bool, orphans: bool, backend_name: str | None, yes: bool, as_json: bool) -> None:
+def stop(notebook: str | None, force: bool, orphans: bool, backend_name: str | None, yes: bool,
+         snapshot: bool | None, as_json: bool) -> None:
     """Final pull, terminate the runtime, remove the record (or --orphans)."""
     store = SessionStore()
     if orphans:
@@ -932,11 +945,15 @@ def stop(notebook: str | None, force: bool, orphans: bool, backend_name: str | N
         raise CliError("missing NOTEBOOK (or use --orphans)")
     session, backend = _find_session(notebook, store)
     was_running = lifecycle.resolve_handle(session, backend) is not None
-    report = lifecycle.stop(session, backend=backend, store=store, force=force)
+    report = lifecycle.stop(session, backend=backend, store=store, force=force, snapshot=snapshot)
     if as_json:
-        _emit_json(_report_json(report))
+        _emit_json({**_report_json(report), "snapshot": report.snapshot})
     else:
         _print_report(report, quiet_when_empty=True)
+        if report.snapshot is not None:
+            click.echo(f"{_c('✓', 'ok')} saved a snapshot of the runtime's filesystem "
+                       f"({report.snapshot['seconds']:.0f}s); the next `nbgpu start {notebook}` resumes from it "
+                       "(--fresh to build instead)")
         if was_running:
             click.echo(f"{_c('✓', 'ok')} stopped session {_c(session.session_id, 'id')}; the runtime is terminated")
         else:

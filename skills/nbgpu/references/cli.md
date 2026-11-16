@@ -29,7 +29,7 @@ unsafe path), sync conflicts, sync errors after the run. `--pull` never
 overwrites a local project file that sync manages. A failed install exits
 non-zero with `nbgpu: error: the notebook was not run: ...`.
 
-### `nbgpu start NOTEBOOK [--detach] [--gpu G] [--cpu N] [--memory M] [--idle-timeout D] [--max-runtime D] [--backend NAME] [--project-root DIR] [--json]`
+### `nbgpu start NOTEBOOK [--detach] [--fresh] [--gpu G] [--cpu N] [--memory M] [--idle-timeout D] [--max-runtime D] [--backend NAME] [--project-root DIR] [--json]`
 
 Creates the runtime, uploads the project, starts marimo, waits until it is
 ready. With `--detach` it then returns; without, it keeps syncing every
@@ -43,7 +43,8 @@ second until interrupted (the runtime keeps running after that).
   "runtime_id": "sb-...",
   "url": "https://...?access_token=...",
   "local_url": null,
-  "rate": {"usd_per_hour": 1.1, "complete": true, "prices_checked": "2026-11-15", "prices_source": "live"}
+  "rate": {"usd_per_hour": 1.1, "complete": true, "prices_checked": "2026-11-15", "prices_source": "live"},
+ "from_snapshot": null, "timings": {"create": 11.4, "upload": 1.3, "ready": 1.4, "total": 14.1}
 }
 ```
 
@@ -75,6 +76,9 @@ and removes the record. Both print a sync report:
   gone.
 
 `stop` exits non-zero with open conflicts unless `--force`.
+`stop --snapshot` (or header `snapshot = true`) saves the runtime's
+filesystem first and adds `"snapshot": {"image", "created_at", "seconds", ...}`;
+the next `start` boots from it when deps, Python and marimo still match.
 
 `sync` then installs packages added to the header and adds `"env": [...]`
 with what it did (`installed polars in the runtime`, or why it could not).

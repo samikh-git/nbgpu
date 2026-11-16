@@ -21,8 +21,19 @@
 - GPU strings are validated against a known list before anything is
   created; an unknown one raises UnsupportedError listing the known ones.
 
-Capabilities: gpu, volumes, max-runtime, live-install, billing (not
-idle-timeout; see below).
+Capabilities: gpu, volumes, max-runtime, live-install, billing, snapshot
+(not idle-timeout; see below).
+
+Cache: spec.compute.cache_volume is looked up (created if missing) and
+mounted at CACHE_MOUNT, with cache_env() set for every process. Modal
+commits a sandbox's volume writes when it terminates; sandboxes running at
+the same time see them only after a reload, so two sessions share the cache
+as of their start.
+
+Snapshots: `snapshot` is Sandbox.snapshot_filesystem (mounted volumes are not
+included) and RuntimeRequest.base_image boots Image.from_id(...) instead of
+building. Modal's memory snapshots are not used: they refuse GPU sandboxes,
+and only the entrypoint's process tree survives a restore.
 
 Billing: `current_prices` reads Workspace.billing.rates() (this workspace's
 current hourly rates) and `spend` reads Workspace.billing.report(), keeping
@@ -97,7 +108,9 @@ from nbgpu.backends.base import (
     CAP_GPU,
     CAP_LIVE_INSTALL,
     CAP_MAX_RUNTIME,
+    CAP_SNAPSHOT,
     CAP_VOLUMES,
+    CACHE_MOUNT,
     EXCLUDED_PARTS,
     TEMP_PREFIX,
     BackendError,
@@ -107,6 +120,7 @@ from nbgpu.backends.base import (
     RuntimeRequest,
     SpendRow,
     UnsupportedError,
+    cache_env,
 )
 from nbgpu.spec import NotebookSpec, requirement_name
 
@@ -175,6 +189,11 @@ def prices_from_rates(rates: Mapping[str, Any]) -> ProviderPrices:
 # Python series supported by recent Modal image builders (2024.10 .. 2026.10)
 # that nbgpu offers. Highest preferred when the local version does not fit.
 SUPPORTED_PYTHONS: tuple[str, ...] = ("3.11", "3.12", "3.13", "3.14")
+
+# Filesystem snapshots (CAP_SNAPSHOT): how long Modal keeps one, and how long
+# taking one may take (a few seconds for hundreds of MB in practice).
+SNAPSHOT_TTL_S = 30 * 24 * 3600
+SNAPSHOT_TIMEOUT_S = 300
 
 # Modal's documented maximum sandbox lifetime.
 MAX_RUNTIME_LIMIT_S = 24 * 60 * 60
@@ -675,6 +694,12 @@ def validate_spec(spec: NotebookSpec) -> dict[str, Any]:
             raise UnsupportedError(f"Volume mount path {mount!r} must be absolute.")
         if not name:
             raise UnsupportedError(f"Volume for {mount!r} has an empty name.")
+    if compute.cache_volume is not None and any(
+        posixpath.normpath(m) == CACHE_MOUNT or posixpath.normpath(m).startswith(CACHE_MOUNT + "/")
+        for m in compute.volumes
+    ):
+        raise UnsupportedError(f"{CACHE_MOUNT} is where the cache volume is mounted; mount yours elsewhere "
+                               "or set `cache = false`.")
     return {
         "gpu": gpu,
         "python_version": choose_python_version(spec.requires_python),
@@ -879,7 +904,8 @@ class _ModalProcess:
 class ModalBackend:
     name = "modal"
     bind_host = "0.0.0.0"
-    capabilities: frozenset[str] = frozenset({CAP_GPU, CAP_VOLUMES, CAP_MAX_RUNTIME, CAP_LIVE_INSTALL, CAP_BILLING})
+    capabilities: frozenset[str] = frozenset(
+        {CAP_GPU, CAP_VOLUMES, CAP_MAX_RUNTIME, CAP_LIVE_INSTALL, CAP_BILLING, CAP_SNAPSHOT})
 
     def __init__(self, app_name: str = "nbgpu") -> None:
         self.app_name = app_name
@@ -943,15 +969,23 @@ class ModalBackend:
         import modal
 
         volumes = self._lookup_volumes(compute.volumes) if compute.volumes else {}
+        env = dict(request.env)
+        if compute.cache_volume is not None:
+            with _modal_errors(f"looking up cache volume {compute.cache_volume!r}"):
+                volumes[CACHE_MOUNT] = modal.Volume.from_name(compute.cache_volume, create_if_missing=True)
+            env = {**cache_env(CACHE_MOUNT), **env}
         app = self._get_app()
-        image = self._build_image(settings["python_version"], settings["packages"])
+        if request.base_image is not None:
+            image = modal.Image.from_id(request.base_image)
+        else:
+            image = self._build_image(settings["python_version"], settings["packages"])
         with _modal_errors("creating sandbox"):
             sb = modal.Sandbox.create(
                 *ENTRYPOINT,
                 app=app,
                 image=image,
                 tags=tags,
-                env=dict(request.env) or None,
+                env=env or None,
                 gpu=settings["gpu"],
                 cpu=compute.cpu,
                 memory=compute.memory_mib,
@@ -1205,6 +1239,14 @@ class ModalBackend:
         if not isinstance(result, dict):
             raise BackendError(f"Modal: unexpected hash output: {res.stdout[:200]!r}")
         return safe_hash_paths(result)
+
+    def snapshot(self, handle: RuntimeHandle) -> str:
+        """snapshot_filesystem: the sandbox's disk, without mounted volumes,
+        kept SNAPSHOT_TTL_S by Modal."""
+        sb = self._sandbox(handle.runtime_id)
+        with _modal_errors(f"snapshotting {handle.runtime_id}"):
+            image = sb.snapshot_filesystem(timeout=SNAPSHOT_TIMEOUT_S, ttl=SNAPSHOT_TTL_S)
+        return str(image.object_id)
 
     def current_prices(self) -> ProviderPrices:
         import modal

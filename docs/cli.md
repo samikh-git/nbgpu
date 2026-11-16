@@ -26,7 +26,7 @@ Conventions that hold for every command:
 ```text
 nbgpu start NOTEBOOK [--gpu G] [--cpu N] [--memory M] [--idle-timeout D]
                      [--max-runtime D] [--backend NAME] [--project-root DIR]
-                     [--detach] [--json]
+                     [--detach] [--fresh] [--json]
 ```
 
 Creates the runtime, uploads the project, starts marimo and waits until it
@@ -51,6 +51,11 @@ background: edits made in the browser reach your disk only when you run
 | `--backend` | `modal` or `local`. Default: `$NBGPU_BACKEND`, else the header's `provider`. |
 | `--project-root` | Directory to upload. Default: the nearest ancestor of the notebook with a `pyproject.toml` or `.git`, else the notebook's directory. |
 | `--detach` | Return once marimo is ready. |
+| `--fresh` | Build the environment even if the notebook has a matching [snapshot](warm-starts.md#filesystem-snapshots). |
+
+If the notebook has a matching filesystem snapshot, the runtime boots from
+it instead of building the environment; the first progress line says
+"from the snapshot of ...".
 
 `start` refuses when the notebook already has a running session; use `open`.
 
@@ -67,11 +72,15 @@ JSON:
   "runtime_id": "sb-...",
   "url": "https://...?access_token=...",
   "local_url": "http://127.0.0.1:2718?access_token=...",
-  "rate": {"usd_per_hour": 1.1, "complete": true, "prices_checked": "2026-11-15", "prices_source": "live"}
+  "rate": {"usd_per_hour": 1.1, "complete": true, "prices_checked": "2026-11-15", "prices_source": "live"},
+  "from_snapshot": null,
+  "timings": {"create": 11.4, "upload": 1.3, "ready": 1.4, "total": 14.1}
 }
 ```
 
 `local_url` is null when there is no proxy (`--detach`, or `NBGPU_NO_PROXY`).
+`from_snapshot` is the snapshot image the runtime booted from, or null.
+`timings` are seconds per step; see [Warm starts](warm-starts.md#seeing-what-a-start-costs).
 `rate` is null when no price is known; `complete: false` means part of the
 shape could not be priced. `prices_source` says where the prices came from
 (`live`: your account's rates, `list`: the built-in table, `file`:
@@ -255,7 +264,7 @@ JSON:
 ## `nbgpu stop`
 
 ```text
-nbgpu stop NOTEBOOK [--force] [--json]
+nbgpu stop NOTEBOOK [--force] [--snapshot | --no-snapshot] [--json]
 ```
 
 Final pull, then terminate the runtime and remove the session record. Prints
@@ -269,6 +278,11 @@ the sync report (same JSON shape as `sync`).
   that browser edits after the last successful sync could not be recovered.
 - A warning lists packages that were installed during the session but are
   not in the notebook's dependencies.
+- `--snapshot` saves the runtime's filesystem before terminating, so the
+  next `start` boots from it (default: the header's
+  [`snapshot`](notebook-header.md#snapshot) key). JSON adds `"snapshot":
+  {"image", "created_at", "seconds", ...}`, or null. A failed snapshot is a
+  warning; the runtime is terminated regardless.
 
 ### `nbgpu stop --orphans`
 

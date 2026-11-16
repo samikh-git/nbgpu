@@ -39,6 +39,24 @@ CAP_LIVE_INSTALL = "live-install"
 # actually cost: the backend has `current_prices()` and `spend()` (see
 # BillingBackend).
 CAP_BILLING = "billing"
+# The runtime's filesystem can be saved (`snapshot(handle)` returns an id)
+# and a runtime created from it (RuntimeRequest.base_image). See SnapshotBackend.
+CAP_SNAPSHOT = "snapshot"
+
+# Where spec.compute.cache_volume is mounted, and what points into it. The
+# variables are the standard ones libraries read, so notebooks need no change.
+CACHE_MOUNT = "/nbgpu-cache"
+
+
+def cache_env(mount: str = CACHE_MOUNT) -> dict[str, str]:
+    return {
+        "NBGPU_CACHE": mount,  # for the notebook's own files
+        "HF_HOME": f"{mount}/huggingface",
+        "TORCH_HOME": f"{mount}/torch",
+        "TORCHINDUCTOR_CACHE_DIR": f"{mount}/torchinductor",
+        "TRITON_CACHE_DIR": f"{mount}/triton",
+        "UV_CACHE_DIR": f"{mount}/uv",
+    }
 
 
 # Prefix for temporary files made by atomic writes, locally and remotely.
@@ -71,6 +89,9 @@ class RuntimeRequest:
     # Ports the runtime must be able to expose later with `expose`.
     ports: tuple[int, ...] = ()
     env: Mapping[str, str] = field(default_factory=dict)
+    # A `snapshot()` id to start from instead of building the environment
+    # (only for backends with CAP_SNAPSHOT). The backend boots it as is.
+    base_image: str | None = None
 
 
 @dataclass(frozen=True)
@@ -235,4 +256,13 @@ class BillingBackend(Backend, Protocol):
         """Billed cost of this tool's runtimes between `start` (inclusive) and
         `end` (exclusive), both UTC, per interval: resolution "h" or "d".
         Only complete intervals are reported. Raises BackendError."""
+        ...
+
+
+class SnapshotBackend(Backend, Protocol):
+    """A Backend with CAP_SNAPSHOT."""
+
+    def snapshot(self, handle: RuntimeHandle) -> str:
+        """Save the runtime's filesystem (not mounted volumes) and return an id
+        for RuntimeRequest.base_image. Raises BackendError."""
         ...

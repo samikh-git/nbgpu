@@ -588,3 +588,35 @@ def test_requirements_files_reject_what_cannot_be_installed(tmp_path, content: s
 def test_missing_requirements_file_is_an_error(tmp_path) -> None:
     with pytest.raises(SpecError, match="cannot read"):
         load_spec(_nb_with_requirements(tmp_path, '"nope.txt"'))
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [(None, "nbgpu-cache"), ("cache = true", "nbgpu-cache"), ("cache = false", None), ('cache = "team-cache"', "team-cache")],
+)
+def test_cache_key(tmp_path: Path, line: str | None, expected: str | None) -> None:
+    path = write_notebook(tmp_path, nbgpu_header(*([line] if line else [])))
+    assert load_spec(path).compute.cache_volume == expected
+
+
+@pytest.mark.parametrize("line", ['cache = ""', "cache = 3", 'snapshot = "yes"'])
+def test_cache_and_snapshot_reject_bad_values(tmp_path: Path, line: str) -> None:
+    with pytest.raises(SpecError, match=line.split(" ")[0]):
+        load_spec(write_notebook(tmp_path, nbgpu_header(line)))
+
+
+def test_snapshot_key(tmp_path: Path) -> None:
+    assert load_spec(write_notebook(tmp_path, nbgpu_header())).snapshot is False
+    assert load_spec(write_notebook(tmp_path, nbgpu_header("snapshot = true"))).snapshot is True
+
+
+def test_cell_cache_is_opt_in(tmp_path: Path) -> None:
+    assert load_spec(write_notebook(tmp_path, nbgpu_header())).cell_cache is False
+    assert load_spec(write_notebook(tmp_path, nbgpu_header("cell-cache = true"))).cell_cache is True
+    with pytest.raises(SpecError, match="cell-cache"):
+        load_spec(write_notebook(tmp_path, nbgpu_header('cell-cache = "yes"')))
+
+
+def test_cell_cache_needs_the_cache_volume(tmp_path: Path) -> None:
+    with pytest.raises(SpecError, match="needs `cache`"):
+        load_spec(write_notebook(tmp_path, nbgpu_header("cell-cache = true", "cache = false")))

@@ -16,6 +16,7 @@ from nbgpu.backends import modal as mb
 from nbgpu.backends.base import (
     ABSENT,
     CAP_BILLING,
+    CAP_SNAPSHOT,
     CAP_GPU,
     CAP_LIVE_INSTALL,
     CAP_IDLE_TIMEOUT,
@@ -51,7 +52,8 @@ def test_init_does_not_contact_modal(monkeypatch: pytest.MonkeyPatch) -> None:
     assert backend.app_name == "nbgpu"
     assert backend.name == "modal"
     assert backend.bind_host == "0.0.0.0"
-    assert backend.capabilities == frozenset({CAP_GPU, CAP_VOLUMES, CAP_MAX_RUNTIME, CAP_LIVE_INSTALL, CAP_BILLING})
+    assert backend.capabilities == frozenset(
+        {CAP_GPU, CAP_VOLUMES, CAP_MAX_RUNTIME, CAP_LIVE_INSTALL, CAP_BILLING, CAP_SNAPSHOT})
     assert CAP_IDLE_TIMEOUT not in backend.capabilities
 
 
@@ -782,3 +784,64 @@ def test_prices_from_rates_leaves_out_missing_or_bad_keys() -> None:
     prices = mb.prices_from_rates({"gpu_hour_cost_t4": "n/a", "gpu_hour_cost_l4": "0.8"})
     assert prices.gpu_hourly == {"L4": 0.8}
     assert prices.cpu_core_hourly is None and prices.memory_gib_hourly is None
+
+
+def _capture_create(monkeypatch: pytest.MonkeyPatch) -> tuple[mb.ModalBackend, dict[str, object]]:
+    import modal
+
+    seen: dict[str, object] = {}
+
+    class FakeSandbox:
+        object_id = "sb-fake"
+
+    def fake_create(*args: object, **kwargs: object) -> FakeSandbox:
+        seen.update(kwargs)
+        return FakeSandbox()
+
+    def built(**k: object) -> object:
+        seen["built"] = True
+        return type("I", (), {"uv_pip_install": lambda self, *p: self})()
+
+    monkeypatch.setattr(modal.Sandbox, "create", fake_create)
+    monkeypatch.setattr(modal.Image, "debian_slim", built)
+    monkeypatch.setattr(modal.Image, "from_id", lambda image_id: f"image:{image_id}")
+    monkeypatch.setattr(modal.Volume, "from_name", lambda name, create_if_missing=False: (name, create_if_missing))
+    backend = mb.ModalBackend()
+    monkeypatch.setattr(backend, "_get_app", lambda: object())
+    monkeypatch.setattr(backend, "exec", lambda *a, **k: mb.ExecResult(0, "", ""))
+    return backend, seen
+
+
+def test_create_mounts_the_cache_volume_and_points_caches_at_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    from nbgpu.backends.base import CACHE_MOUNT, RuntimeRequest
+
+    backend, seen = _capture_create(monkeypatch)
+    backend.create(RuntimeRequest(spec=_spec(), tags={}, env={"HF_HOME": "/mine"}))
+    assert seen["volumes"] == {CACHE_MOUNT: ("nbgpu-cache", True)}  # created on first use
+    env = seen["env"]
+    assert env["TORCHINDUCTOR_CACHE_DIR"] == f"{CACHE_MOUNT}/torchinductor"  # type: ignore[index]
+    assert env["HF_HOME"] == "/mine"  # type: ignore[index]  # an explicit request wins
+
+
+def test_create_without_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    from nbgpu.backends.base import RuntimeRequest
+
+    backend, seen = _capture_create(monkeypatch)
+    backend.create(RuntimeRequest(spec=_spec(cache_volume=None), tags={}))
+    assert seen["volumes"] == {} and seen["env"] is None
+
+
+def test_create_from_a_snapshot_skips_the_build(monkeypatch: pytest.MonkeyPatch) -> None:
+    from nbgpu.backends.base import RuntimeRequest
+
+    backend, seen = _capture_create(monkeypatch)
+    backend.create(RuntimeRequest(spec=_spec(), tags={}, base_image="im-123"))
+    assert seen["image"] == "image:im-123" and "built" not in seen
+
+
+def test_a_user_volume_on_the_cache_mount_is_refused() -> None:
+    from nbgpu.backends.base import CACHE_MOUNT
+
+    with pytest.raises(mb.UnsupportedError, match="cache = false"):
+        mb.validate_spec(_spec(volumes={CACHE_MOUNT + "/x": "v"}))
+    mb.validate_spec(_spec(volumes={CACHE_MOUNT: "v"}, cache_volume=None))

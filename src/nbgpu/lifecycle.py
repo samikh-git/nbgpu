@@ -75,14 +75,17 @@ import collections
 import contextlib
 import datetime
 import hashlib
+import importlib.metadata
 import importlib.resources
 import json
 import os
 import posixpath
 import re
 import secrets
+import shlex
 import signal
 import stat
+import sys
 import tempfile
 import threading
 import time
@@ -98,6 +101,9 @@ from nbgpu import cost, sync, watchdog
 from nbgpu.backends.base import (
     CAP_BILLING,
     CAP_LIVE_INSTALL,
+    CAP_SNAPSHOT,
+    CAP_VOLUMES,
+    CACHE_MOUNT,
     Backend,
     BackendError,
     RemoteProcess,
@@ -122,7 +128,7 @@ from nbgpu.session import (
 from nbgpu import envsync
 from nbgpu.envsync import applied_extra
 from nbgpu.ignore import IgnoreRules
-from nbgpu.spec import ComputeSpec, load_spec
+from nbgpu.spec import ComputeSpec, NotebookSpec, SpecError, load_spec
 from nbgpu.sync import SyncEngine, SyncReport
 
 MARIMO_PORT = 2718
@@ -186,6 +192,8 @@ _EXTRA_RATE_COMPLETE = "rate_complete"
 _EXTRA_RATE_NOTE = "rate_note"
 _EXTRA_PRICES_CHECKED = "prices_checked"
 _EXTRA_PRICES_SOURCE = "prices_source"
+_EXTRA_TIMINGS = "timings"
+_EXTRA_FROM_SNAPSHOT = "from_snapshot"
 _EXTRA_STATE = "state"  # STATE_STARTING while a start is in progress
 _EXTRA_KIND = "kind"  # "run" for a one-off run's record
 _EXTRA_OWNER_PID = "owner_pid"  # the process creating (or, for a run, using) the runtime
@@ -585,6 +593,20 @@ def rate_for(compute: ComputeSpec, state_dir: Path | None = None) -> Rate | None
     return cost.hourly_rate(compute, prices)
 
 
+def session_timings(session: Session) -> dict[str, float]:
+    """Seconds per start phase (create, upload, ready, total), or {}."""
+    try:
+        value = json.loads(session.extra.get(_EXTRA_TIMINGS, "") or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return {k: float(v) for k, v in value.items() if isinstance(v, int | float)} if isinstance(value, dict) else {}
+
+
+def session_snapshot(session: Session) -> str | None:
+    """The snapshot image the session booted from, or None."""
+    return session.extra.get(_EXTRA_FROM_SNAPSHOT) or None
+
+
 def session_rate(session: Session) -> Rate | None:
     """The rate recorded at start, or None if none was recorded."""
     raw = session.extra.get(_EXTRA_RATE)
@@ -888,6 +910,170 @@ def session_engine(
 
 
 # ---------------------------------------------------------------------------
+# filesystem snapshots (CAP_SNAPSHOT)
+#
+# `stop` can save the runtime's filesystem; the next `start` of the same
+# notebook boots from it when nothing that shaped that filesystem changed:
+# the backend, the dependencies, requires-python, this machine's Python
+# minor version (the runtime's Python follows it) and marimo's version
+# (pinned to the local one). Compute (gpu, cpu, memory, volumes) may differ.
+# Records live in the state directory (SNAPSHOTS_NAME), one per notebook.
+
+SNAPSHOTS_NAME = "snapshots.json"
+# A little under Modal's retention (backends.modal.SNAPSHOT_TTL_S), so an
+# expired image is not even tried.
+SNAPSHOT_MAX_AGE_S = 29 * 24 * 3600
+
+
+def snapshot_key(backend_name: str, dependencies: Sequence[str], requires_python: str | None) -> dict[str, object]:
+    try:
+        marimo_version = importlib.metadata.version("marimo")
+    except importlib.metadata.PackageNotFoundError:
+        marimo_version = ""
+    return {
+        "backend": backend_name,
+        "deps": sorted(dependencies),
+        "requires_python": requires_python,
+        "python": f"{sys.version_info.major}.{sys.version_info.minor}",
+        "marimo": marimo_version,
+    }
+
+
+def _read_snapshots(store: SessionStore) -> dict[str, dict]:
+    try:
+        data = json.loads((store.directory / SNAPSHOTS_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return {k: v for k, v in data.items() if isinstance(v, dict)} if isinstance(data, dict) else {}
+
+
+def _write_snapshots(store: SessionStore, records: Mapping[str, dict]) -> None:
+    ensure_private_dir(store.directory)
+    path = store.directory / SNAPSHOTS_NAME
+    fd, tmp = tempfile.mkstemp(prefix=".snapshots-", dir=store.directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            os.fchmod(f.fileno(), 0o600)
+            json.dump(dict(records), f, indent=1, sort_keys=True)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def snapshot_for(notebook: Path, store: SessionStore) -> dict | None:
+    """The notebook's snapshot record (any key), or None."""
+    return _read_snapshots(store).get(str(Path(notebook).resolve()))
+
+
+def matching_snapshot(spec: NotebookSpec, backend: Backend, store: SessionStore,
+                      now: float | None = None) -> dict | None:
+    """The notebook's snapshot if `backend` can boot it and it fits `spec`."""
+    if CAP_SNAPSHOT not in backend.capabilities:
+        return None
+    record = snapshot_for(spec.path, store)
+    if record is None or not isinstance(record.get("image"), str):
+        return None
+    age = (time.time() if now is None else now) - float(record.get("created_at", 0))
+    if not 0 <= age <= SNAPSHOT_MAX_AGE_S:
+        return None
+    if record.get("key") != snapshot_key(backend.name, spec.dependencies, spec.requires_python):
+        return None
+    return record
+
+
+def forget_snapshot(notebook: Path, store: SessionStore) -> bool:
+    """Drop the notebook's snapshot record. True if there was one. (The
+    provider deletes the image itself when it expires.)"""
+    records = _read_snapshots(store)
+    if records.pop(str(Path(notebook).resolve()), None) is None:
+        return False
+    _write_snapshots(store, records)
+    return True
+
+
+def _save_snapshot(session: Session, backend: Backend, handle: RuntimeHandle, store: SessionStore) -> dict:
+    """Snapshot the runtime and record it for the notebook's next start. The
+    key uses the dependencies the runtime actually has (live installs
+    included) and the header's requires-python."""
+    try:
+        applied = json.loads(session.extra.get(envsync.EXTRA_ENV, "") or "{}")
+    except json.JSONDecodeError:
+        applied = {}
+    deps = applied.get("deps") if isinstance(applied, dict) else None
+    spec = load_spec(session.notebook)
+    if not isinstance(deps, list):
+        deps = list(spec.dependencies)
+    started = time.monotonic()
+    image = backend.snapshot(handle)  # type: ignore[attr-defined]
+    record = {
+        "image": image,
+        "created_at": time.time(),
+        "seconds": round(time.monotonic() - started, 1),
+        "session_id": session.session_id,
+        "key": snapshot_key(backend.name, deps, spec.requires_python),
+    }
+    records = _read_snapshots(store)
+    records[str(session.notebook)] = record
+    _write_snapshots(store, records)
+    return record
+
+
+def project_cache_id(project_root: Path) -> str:
+    """A short, stable id for a local project. Every project lands at the
+    same remote path, so per-project caches on a shared volume need it."""
+    return hashlib.sha256(str(Path(project_root).resolve()).encode()).hexdigest()[:12]
+
+
+def cell_cache_paths(spec: NotebookSpec, backend: Backend, handle: RuntimeHandle, project_root: Path,
+                     rel_notebook: str) -> tuple[str, str] | None:
+    """(link, target) for `cell-cache`, or None when it does not apply.
+
+    marimo keeps mo.persistent_cache entries in `__marimo__/cache` next to
+    the notebook. With cell-cache that folder on the runtime is a symlink
+    into the cache volume, per project and notebook directory, so the
+    entries outlive the runtime. Only that folder moves: pointing
+    PYTHONPYCACHEPREFIX at the volume would also move Python's bytecode,
+    and reading it from the volume made `import torch` take minutes
+    (measured 2026-11-15). `__marimo__` is never synced, so the link stays
+    on the runtime."""
+    if not (spec.cell_cache and spec.compute.cache_volume is not None and CAP_VOLUMES in backend.capabilities):
+        return None
+    directory = posixpath.dirname(rel_notebook)
+    link = posixpath.join(handle.remote_root, directory, "__marimo__", "cache")
+    target = posixpath.join(CACHE_MOUNT, "marimo", project_cache_id(project_root), directory or ".")
+    return link, posixpath.normpath(target)
+
+
+def _link_cell_cache(backend: Backend, handle: RuntimeHandle, paths: tuple[str, str] | None) -> None:
+    if paths is None:
+        return
+    link, target = paths
+    q = shlex.quote
+    script = (f"mkdir -p {q(target)} {q(posixpath.dirname(link))} && rm -rf {q(link)} "
+              f"&& ln -s {q(target)} {q(link)}")
+    result = backend.exec(handle, ["sh", "-c", script], cwd="/", timeout_s=120)
+    if result.exit_code != 0:
+        raise BackendError(f"linking marimo's cache to the cache volume failed: "
+                           f"{result.stderr.strip() or result.stdout.strip()}")
+
+
+def _first_line(text: str) -> str:
+    return text.strip().splitlines()[0] if text.strip() else ""
+
+
+def _reset_runtime_dir(backend: Backend, handle: RuntimeHandle) -> None:
+    """A runtime booted from a snapshot has the old project, token and
+    markers; remove them so the upload and the new token are all there is."""
+    parent = posixpath.dirname(handle.remote_root.rstrip("/"))
+    script = f"rm -rf {shlex.quote(parent)} && mkdir -p {shlex.quote(handle.remote_root)}"
+    result = backend.exec(handle, ["sh", "-c", script], cwd="/", timeout_s=120)
+    if result.exit_code != 0:
+        raise BackendError(f"clearing the snapshot's old project failed: {result.stderr.strip() or result.stdout.strip()}")
+
+
+# ---------------------------------------------------------------------------
 # start
 
 
@@ -900,11 +1086,15 @@ def start(
     project_root: Path | None = None,
     ready_timeout_s: float = 300.0,
     progress: Callable[[str], None] | None = None,
+    fresh: bool = False,
 ) -> Session:
     """`progress`, if given, is called with a short description as each
-    startup step begins ("creating the runtime", "uploading 44 files", ...)."""
+    startup step begins ("creating the runtime", "uploading 44 files", ...).
+    The notebook's filesystem snapshot is used when one matches
+    (matching_snapshot), unless `fresh`. Phase durations are recorded in the
+    session (session_timings)."""
     with signals_as_interrupt():
-        return _start(notebook, backend, store, overrides, project_root, ready_timeout_s, progress)
+        return _start(notebook, backend, store, overrides, project_root, ready_timeout_s, progress, fresh)
 
 
 def _start(
@@ -915,8 +1105,11 @@ def _start(
     project_root: Path | None,
     ready_timeout_s: float,
     progress: Callable[[str], None] | None = None,
+    fresh: bool = False,
 ) -> Session:
     step = progress or (lambda _message: None)
+    began = time.monotonic()
+    timings: dict[str, float] = {}
     spec = load_spec(notebook, overrides)
     notebook = spec.path
     root = Path(project_root).resolve() if project_root is not None else find_project_root(notebook)
@@ -965,18 +1158,40 @@ def _start(
     # long creating it takes, and a crash leaves a visible record.
     store.save(session)
 
-    step(f"creating the runtime ({_shape(spec.compute)})")
+    if spec.cell_cache and CAP_VOLUMES not in backend.capabilities:
+        step(f"cell-cache: the {backend.name} backend has no cache volume, so marimo's cache stays on the runtime")
+    base = None if fresh else matching_snapshot(spec, backend, store)
+    if base is not None:
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(base["created_at"])))
+        step(f"creating the runtime ({_shape(spec.compute)}) from the snapshot of {when}")
+    else:
+        step(f"creating the runtime ({_shape(spec.compute)})")
+    phase = time.monotonic()
     try:
-        handle = backend.create(RuntimeRequest(spec=spec, tags=tags, ports=(MARIMO_PORT,)))
+        try:
+            handle = backend.create(RuntimeRequest(spec=spec, tags=tags, ports=(MARIMO_PORT,),
+                                                   base_image=base["image"] if base else None))
+        except BackendError as exc:
+            if base is None:
+                raise
+            # The image may have expired or been deleted: build instead.
+            forget_snapshot(spec.path, store)
+            step(f"the snapshot could not be used ({_first_line(str(exc))}); building the environment instead")
+            base = None
+            handle = backend.create(RuntimeRequest(spec=spec, tags=tags, ports=(MARIMO_PORT,)))
     except BaseException as exc:
         _abandon_create(session, backend, store, exc)
         raise
+    timings["create"] = time.monotonic() - phase
     try:
         session.runtime_id = handle.runtime_id
         session.remote_root = handle.remote_root
         session.created_at = handle.created_at
         store.save(session)
+        if base is not None:
+            _reset_runtime_dir(backend, handle)
 
+        phase = time.monotonic()
         step(f"uploading {files} file{'s' if files != 1 else ''} ({_size_text(size)}) from {root.name}/")
         token = new_token()
         token_file = token_path(handle)
@@ -997,6 +1212,9 @@ def _start(
         )
         _private_file(state_path)
         note_synced(session, store)
+        _link_cell_cache(backend, handle, cell_cache_paths(spec, backend, handle, root, rel_notebook))
+        timings["upload"] = time.monotonic() - phase
+        phase = time.monotonic()
 
         pidfile = runtime_path(handle, MARIMO_PIDFILE_NAME)
         argv = _marimo_argv(
@@ -1016,8 +1234,15 @@ def _start(
 
         session.url = url
         session.token = token
+        timings["ready"] = time.monotonic() - phase
+        timings["total"] = time.monotonic() - began
         price_refresh.join(timeout=2.0)
-        session.extra = {**extra, **_rate_extra(rate_for(spec.compute, store.directory))}
+        session.extra = {
+            **extra,
+            **_rate_extra(rate_for(spec.compute, store.directory)),
+            _EXTRA_TIMINGS: json.dumps({k: round(v, 2) for k, v in timings.items()}),
+            **({_EXTRA_FROM_SNAPSHOT: base["image"]} if base is not None else {}),
+        }
         store.save(session)
         return session
     except BaseException as exc:
@@ -1278,6 +1503,7 @@ def stop(
     ignore_conflicts: bool = False,
     terminate_on_error: bool = False,
     engine: SyncEngine | None = None,
+    snapshot: bool | None = None,
 ) -> SyncReport:
     """Final pull, then terminate and remove the record (and its sync state).
     With open conflicts, raise StopRefused unless ignore_conflicts (then:
@@ -1287,6 +1513,11 @@ def stop(
     terminate_on_error (only for an explicit user --force), in which case
     the runtime is terminated anyway and the error raised afterwards.
     force=True means both. `engine` reuses the caller's engine.
+
+    `snapshot` (None: the header's `snapshot` key) saves the runtime's
+    filesystem before terminating, on backends with CAP_SNAPSHOT, so the next
+    start resumes from it; the report's `snapshot` holds the record. A failed
+    snapshot is a warning, never a reason to keep the runtime.
 
     If the runtime is already gone there is nothing to pull: the record is
     removed and the report's `warnings` say that browser edits after the
@@ -1327,9 +1558,21 @@ def stop(
                 "or stop with --force to keep the local versions and the conflict copies"
             )
         unrecorded = _unrecorded_installs(session, backend, handle)
+        notes = []
+        if snapshot is None:
+            try:
+                snapshot = load_spec(session.notebook).snapshot
+            except SpecError:
+                snapshot = False
+        if snapshot and CAP_SNAPSHOT not in backend.capabilities:
+            notes.append(f"the {backend.name} backend cannot snapshot a runtime; nothing was saved")
+        elif snapshot:
+            try:
+                report.snapshot = _save_snapshot(session, backend, handle, store)
+            except Exception as exc:  # noqa: BLE001 - never keeps a runtime billing
+                notes.append(f"the snapshot failed ({exc}); the next start builds the environment instead")
         _terminate(backend, handle)
         _forget(session, store)
-        notes = []
         if unrecorded:
             notes.append(
                 f"installed during the session but not in {session.notebook.name}'s dependencies: "
@@ -1598,6 +1841,7 @@ def run(
             with tempfile.TemporaryDirectory(prefix="nbgpu-run-") as tmp:
                 engine = _new_engine(root, backend, handle, Path(tmp) / "sync.json", spec.exclude)
                 engine.initial_push()
+                _link_cell_cache(backend, handle, cell_cache_paths(spec, backend, handle, root, rel_notebook))
                 result = _run_in(backend, handle, rel_notebook, max_output_lines, out_dir)
                 _sync_after_run(engine, root, backend, handle, pull, spec.exclude, result)
             return result

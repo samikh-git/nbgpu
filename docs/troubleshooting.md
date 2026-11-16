@@ -40,6 +40,22 @@ Use `nbgpu open NOTEBOOK` to attach, or `nbgpu stop NOTEBOOK` first.
 The image is being built for a new set of dependencies. This happens once
 per set. A scarce GPU type can also take a while to schedule.
 
+**`the snapshot could not be used (...); building the environment instead`**
+The provider no longer has the snapshot image (expired or deleted). The
+start carries on with a normal build; nothing to do.
+
+**`/nbgpu-cache is where the cache volume is mounted`**
+A `volumes` entry uses the cache's mount path. Mount yours elsewhere, or set
+`cache = false`.
+
+**`cell-cache keeps marimo's cache on the cache volume; it needs `cache``**
+The header has `cell-cache = true` and `cache = false`. Turn one of them
+around.
+
+**A `mo.persistent_cache` block runs again in every session**
+Add `cell-cache = true` to the header. Without it marimo's cache lives on
+the runtime and goes when it stops.
+
 **marimo did not become ready; `last output:` follows**
 marimo failed on the runtime and its last lines are in the message. The
 usual causes are a syntax error in the notebook or a dependency that

@@ -58,9 +58,12 @@ Gaps in what exists today.
 
 ## Faster and more flexible compute
 
-- **Warm starts.** Snapshot a session's environment, data and model weights
-  and resume from that instead of rebuilding. Modal has sandbox filesystem
-  snapshots; whether they cover this case is unchecked.
+- **Warm starts.** Done: the cache volume, filesystem snapshots, and the
+  opt-in cell cache (`mo.persistent_cache` on the volume); see
+  [Warm starts](warm-starts.md). Still open: resuming the kernel's memory
+  itself. Modal's memory snapshots refuse GPU sandboxes and only restore
+  the entrypoint's process tree (probed 2026-11-15); for CPU-only
+  notebooks a "hibernate" built on them is possible.
 - **More backends.** The backend contract is small by design. An SSH backend
   would cover any reachable GPU machine (a home box, a university cluster);
   RunPod or Lambda would add capacity and price competition.

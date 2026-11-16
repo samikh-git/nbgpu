@@ -63,6 +63,9 @@ Every `[tool.nbgpu]` key is optional. An unknown key is an error, not ignored.
 | `volumes` | `{ "/data" = "my-datasets" }` | none | Absolute mount path → provider volume name. The volume must already exist (`modal volume create my-datasets`); nbgpu does not create it. |
 | `exclude` | `["data/", "*.ckpt"]` | none | gitignore-style, relative to the project root; never uploaded or pulled. `.gitignore` is always respected. |
 | `requirements` | `"requirements.txt"` | none | Path or list, relative to the notebook. Package lines and `-r` includes only. |
+| `cache` | `false`, `"team-cache"` | `true` (volume `nbgpu-cache`) | Volume at `/nbgpu-cache` for HF, torch hub, compile and uv caches, kept between sessions. Save your own expensive intermediates under `os.environ["NBGPU_CACHE"]`. |
+| `snapshot` | `true` | `false` | Save the runtime's filesystem at every stop so the next start boots from it. |
+| `cell-cache` | `true` | `false` | Keep `mo.persistent_cache` entries on the cache volume so cached blocks are restored in later sessions. Opt-in: only set it if the user asked for cross-session caching. |
 
 Also read from the header:
 
@@ -119,6 +122,29 @@ uvx marimo check nb.py
   the exit code is how `nbgpu run` reports success.
 - Fail fast: assert `torch.cuda.is_available()` in an early cell so a
   misconfigured header costs seconds, not a full data load.
+
+## Caching expensive cells
+
+`mo.persistent_cache` skips a block whose code and inputs are unchanged and
+restores its variables from disk:
+
+```python
+@app.cell
+def _(encoder, corpus, mo):
+    with mo.persistent_cache(name="embeddings"):
+        embeddings = encoder.encode(corpus).cpu()
+    return (embeddings,)
+```
+
+- Within one session this always works. To keep the cache across sessions
+  the header needs `cell-cache = true`; add it only when the user wants
+  that, since cached blocks then skip on later runs (prints and file writes
+  inside them included).
+- Cache computed results (embeddings, preprocessed data, eval outputs,
+  `state_dict()`s), not pretrained model loading: weights already come from
+  the cache volume faster than a multi-GB pickle.
+- `.cpu()` tensors before caching if the notebook may run without a GPU.
+- Rename the cache (`name=`) to force a recompute.
 
 ## Editing a notebook that has a live session
 

@@ -64,11 +64,15 @@ A backend provides a small set of operations on a *runtime*:
 | `terminate` | Stop and release |
 
 Optional abilities are declared as capabilities (`gpu`, `volumes`,
-`max-runtime`, `idle-timeout`, `live-install`, `billing`). A backend that
+`max-runtime`, `idle-timeout`, `live-install`, `billing`, `snapshot`). A backend that
 lacks one raises `UnsupportedError` for a spec that needs it; nothing is
 approximated. `billing` adds two operations: `current_prices()` (the
 account's hourly rates, cached for estimates) and `spend(start, end,
 resolution)` (what this tool's runtimes were billed, for `nbgpu cost`).
+`snapshot` adds `snapshot(handle)`, returning an id that
+`RuntimeRequest.base_image` boots instead of building the environment.
+`spec.compute.cache_volume` is mounted at `CACHE_MOUNT` with `cache_env()`
+by backends with volumes, and ignored by the others.
 
 Everything else (starting marimo, sync, idle detection, cost) is built on
 these operations, which is what keeps a new provider small.

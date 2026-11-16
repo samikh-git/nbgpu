@@ -19,6 +19,9 @@ A notebook declares what it needs in a [PEP 723](https://peps.python.org/pep-072
 # volumes = { "/data" = "my-datasets" }
 # exclude = ["data/", "*.ckpt"]
 # requirements = "requirements.txt"
+# cache = true
+# snapshot = false
+# cell-cache = false
 # ///
 ```
 
@@ -122,6 +125,35 @@ Only package lines and `-r` includes are supported. Any other option
 (`-e`, `--index-url`, ...) is an error naming the file and line, rather than
 being silently dropped.
 
+### `cache`
+
+A volume for downloads and compile caches, kept between sessions and
+mounted at `/nbgpu-cache`. `HF_HOME`, `TORCH_HOME`, the `torch.compile` and
+Triton caches and uv's cache point into it. Default `true`, which uses a
+volume named `nbgpu-cache`, created on first use.
+
+```toml
+cache = false          # off
+cache = "team-cache"   # another volume (created if missing)
+```
+
+See [Warm starts](warm-starts.md#the-cache-volume).
+
+### `snapshot`
+
+`true` saves the runtime's filesystem at every stop, so the next start boots
+from it instead of building the environment (packages installed live
+included). Default `false`; `nbgpu stop --snapshot` does it for one stop.
+See [Warm starts](warm-starts.md#filesystem-snapshots).
+
+### `cell-cache`
+
+`true` keeps marimo's own cache (blocks wrapped in `mo.persistent_cache`)
+on the cache volume, so cached blocks are restored in later sessions instead
+of recomputed. Default `false`: a cached block is skipped on later runs,
+which you should choose knowingly. Needs `cache`. See
+[Warm starts](warm-starts.md#the-cell-cache).
+
 ## `dependencies`
 
 Installed into the runtime's image with uv when the session starts.
@@ -159,3 +191,6 @@ nbgpu start train.py --gpu H100 --max-runtime 2h
 | Remove a dependency | Stays installed until the next start |
 | `gpu`, `cpu`, `memory`, `volumes`, `requires-python` | Next start |
 | `exclude` | Next start |
+| `cache` | Next start |
+| `snapshot` | Read at stop |
+| `cell-cache` | Next start |

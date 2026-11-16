@@ -353,6 +353,8 @@ class SyncReport:
     skipped: list[str] = field(default_factory=list)
     # Problems that did not fail the operation (e.g. the manifest write).
     warnings: list[str] = field(default_factory=list)
+    # Set by lifecycle.stop when it saved a filesystem snapshot: its record.
+    snapshot: dict | None = None
 
     @property
     def changed(self) -> bool:

@@ -90,6 +90,21 @@ check-and-replace must be one step inside the runtime; helper execs must set
 `NBGPU_INTERNAL=1` so the watchdog ignores them; tags must be set atomically
 at creation.
 
+**Warm starts**: `spec.compute.cache_volume` → Modal mounts it at
+`CACHE_MOUNT` with `cache_env()`. Snapshots: `lifecycle.stop(snapshot=)`
+calls `backend.snapshot` after the final pull and before terminate (failure
+is a warning, never keeps the runtime); records live in
+`<state>/snapshots.json` keyed by notebook path; `matching_snapshot` keys on
+backend, sorted applied deps, requires-python, local Python minor and
+marimo version, never compute. A start from a snapshot must call
+`_reset_runtime_dir` before uploading, or the old project and token leak in.
+Modal memory snapshots were probed and rejected (no GPU sandboxes; only the
+entrypoint's process tree survives). `cell-cache` symlinks the notebook's
+`__marimo__/cache` on the runtime into the volume (`cell_cache_paths`,
+`_link_cell_cache`, run after the upload in start and one-off run). Do not
+switch it to PYTHONPYCACHEPREFIX: bytecode on the volume made `import torch`
+take 210 s.
+
 **Prices**: normally the account's live rates are used: `start` and `cost`
 call `lifecycle.refresh_live_prices`, which on a `billing` backend caches
 `current_prices()` once a day. `src/nbgpu/prices.toml` is the fallback:

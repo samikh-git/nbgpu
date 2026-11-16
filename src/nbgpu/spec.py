@@ -48,9 +48,12 @@ TOOL_TABLE = "nbgpu"
 DEFAULT_PROVIDER = "modal"
 DEFAULT_IDLE_TIMEOUT_S = 20 * 60
 DEFAULT_MAX_RUNTIME_S = 8 * 60 * 60
+# The volume `cache` uses unless the header names another (or turns it off).
+DEFAULT_CACHE_VOLUME = "nbgpu-cache"
 
 KNOWN_KEYS = frozenset(
-    {"provider", "gpu", "cpu", "memory", "idle-timeout", "max-runtime", "volumes", "exclude", "requirements"}
+    {"provider", "gpu", "cpu", "memory", "idle-timeout", "max-runtime", "volumes", "exclude", "requirements",
+     "cache", "snapshot", "cell-cache"}
 )
 
 
@@ -70,6 +73,10 @@ class ComputeSpec:
     max_runtime_s: int = DEFAULT_MAX_RUNTIME_S
     # Absolute mount path in the runtime -> provider volume name.
     volumes: Mapping[str, str] = field(default_factory=dict)
+    # Volume for download and compile caches, kept between sessions
+    # (backends.base.CACHE_MOUNT); None turns it off. Backends without
+    # volumes ignore it: their disk already persists.
+    cache_volume: str | None = DEFAULT_CACHE_VOLUME
 
 
 @dataclass(frozen=True)
@@ -82,6 +89,13 @@ class NotebookSpec:
     exclude: tuple[str, ...] = ()
     # requirements files read into `dependencies` (absolute paths)
     requirement_files: tuple[Path, ...] = ()
+    # Snapshot the runtime's filesystem at stop so the next start resumes
+    # from it ([tool.nbgpu] snapshot; `nbgpu stop --snapshot` for one stop).
+    snapshot: bool = False
+    # Keep marimo's own cache (mo.persistent_cache, `__marimo__/cache`) on the
+    # cache volume so it survives sessions ([tool.nbgpu] cell-cache). Opt-in:
+    # it also moves Python's bytecode cache there.
+    cell_cache: bool = False
 
 
 # The PEP 723 reference regex.
@@ -237,7 +251,19 @@ def _compute(table: Mapping[str, object]) -> ComputeSpec:
         kwargs["max_runtime_s"] = _with_key("max-runtime", parse_duration, table["max-runtime"])
     if "volumes" in table:
         kwargs["volumes"] = _volumes(table["volumes"])
+    if "cache" in table:
+        kwargs["cache_volume"] = _cache(table["cache"])
     return ComputeSpec(**kwargs)
+
+
+def _cache(value: object) -> str | None:
+    if value is True:
+        return DEFAULT_CACHE_VOLUME
+    if value is False:
+        return None
+    if isinstance(value, str) and value:
+        return value
+    raise SpecError(f"cache must be true, false or a volume name, got {value!r}")
 
 
 def parse_requirements_file(path: Path, _seen: frozenset[Path] = frozenset()) -> list[str]:
@@ -319,11 +345,23 @@ def load_spec(path: Path, overrides: Mapping[str, object] | None = None) -> Note
     files = _requirement_files(merged["requirements"], path.parent) if "requirements" in merged else ()
     for file in files:
         dependencies = [*dependencies, *parse_requirements_file(file)]
+    compute = _compute({k: v for k, v in merged.items() if k not in ("exclude", "requirements", "snapshot", "cell-cache")})
+    cell_cache = _bool("cell-cache", merged["cell-cache"]) if "cell-cache" in merged else False
+    if cell_cache and compute.cache_volume is None:
+        raise SpecError("cell-cache keeps marimo's cache on the cache volume; it needs `cache` (remove `cache = false`)")
     return NotebookSpec(
         path=path,
         requires_python=requires_python,
         dependencies=tuple(dependencies),
-        compute=_compute({k: v for k, v in merged.items() if k not in ("exclude", "requirements")}),
+        compute=compute,
         exclude=_exclude(merged["exclude"]) if "exclude" in merged else (),
         requirement_files=files,
+        snapshot=_bool("snapshot", merged["snapshot"]) if "snapshot" in merged else False,
+        cell_cache=cell_cache,
     )
+
+
+def _bool(key: str, value: object) -> bool:
+    if not isinstance(value, bool):
+        raise SpecError(f"{key} must be true or false, got {value!r}")
+    return value

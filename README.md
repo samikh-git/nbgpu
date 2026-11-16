@@ -67,6 +67,7 @@ modal setup
 | [Sync and conflicts](docs/sync.md) | What moves, what does not, resolving conflicts |
 | [Environments](docs/environments.md) | Dependencies, live installs, Python version |
 | [Sessions, idle and cost](docs/sessions-and-cost.md) | Lifecycle, idle shutdown, orphans, pricing |
+| [Warm starts](docs/warm-starts.md) | The cache volume, filesystem snapshots, start timings |
 | [Using nbgpu with agents](docs/agents.md) | The agent loop and the bundled skills |
 | [Architecture](docs/architecture.md) | How the pieces fit; adding a backend |
 | [Roadmap](docs/roadmap.md) | Where it could go next |

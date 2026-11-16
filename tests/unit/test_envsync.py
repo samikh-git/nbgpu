@@ -287,3 +287,10 @@ def test_a_backend_override_is_not_a_provider_change(env) -> None:
     session.extra = {**session.extra, EXTRA_ENV: json.dumps(applied)}  # type: ignore[union-attr]
     store.save(session)  # type: ignore[arg-type]
     assert _watcher(store, backend, nb).apply().messages == []
+
+
+def test_turning_cell_cache_on_applies_on_the_next_start(env) -> None:
+    nb, backend, watcher, _ = env()
+    write(nb, header(["marimo"], "# cell-cache = true\n"))
+    [msg] = watcher.tick()
+    assert msg.startswith("!") and "cell-cache changed (False → True)" in msg and "next start" in msg
