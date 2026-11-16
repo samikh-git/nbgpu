@@ -242,6 +242,12 @@ something connects, with every cell unrun. If no cell has run yet, `exec`
 first runs the whole notebook and says so (`ran_notebook`), so the
 variables exist. After that, nothing re-runs unless asked.
 
+**Output** appears as it is printed, so a long cell shows its progress.
+Like `run`'s, it is bounded by `--max-lines`: the first half is printed
+live, and if the output runs longer the rest is held, so you see the first
+and last halves around a marker line, with the full text in a log file.
+`--json` prints its one document at the end.
+
 **Sharing the kernel.** It is the same kernel the browser shows. A browser
 opened later is a normal editor. While a cell runs in the browser, `exec`
 waits for it. Ctrl-C interrupts the code `exec` started.
@@ -262,7 +268,10 @@ like `run`'s. `error` is one line when `ok` is false: the exception, or
 error state otherwise. The exit code is 0 when `ok`, else 1.
 
 `exec` needs a running session (`nbgpu start`) and marimo 0.25 or newer,
-which has the kernel execute API it uses.
+which has the kernel execute API it uses. A call is one request to marimo:
+on Modal an expression takes about half a second end to end, most of it
+connecting to the tunnel. nbgpu remembers the kernel between calls
+and finds it again if marimo no longer knows it.
 
 ## `nbgpu cost`
 

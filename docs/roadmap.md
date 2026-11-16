@@ -43,8 +43,10 @@ Gaps in what exists today.
   - Latency on Modal: about 0.3 s per call over the tunnel.
   - marimo's own value formatting (HTML, tagged JSON) is not agent-friendly,
     so the code nbgpu sends computes `repr()` itself.
-  Still open: streaming output of long cells as they run (output arrives at
-  the end, like `run`'s).
+  Since then: output streams as it is printed (bounded like `run`'s), and
+  the kernel's id is remembered, so a call is one request (0.77 s → 0.52 s
+  per expression on Modal, measured 2026-11-15; the rest is process start
+  and the TLS handshake).
 - **An MCP server.** Expose start, run, sync, status, stop and cost as MCP
   tools so agents call them directly instead of shelling out and parsing
   JSON. Guardrails ("ask before anything above $X/h") become part of the

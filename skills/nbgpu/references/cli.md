@@ -55,7 +55,9 @@ missing cell name with the named cells listed, or that marimo did not load
 the edit in time. `cells`: every cell for `--list`; otherwise the cells left
 in an error state (statuses: `idle`, `stale`, `exception`, `marimo-error`,
 `cancelled`, `interrupted`, `queued`, `running`, `disabled`). Output is
-bounded like `run`'s. Needs marimo 0.25+ on the runtime.
+bounded like `run`'s; without `--json` it is printed as it arrives (the
+first half of `--max-lines` live, the last half at the end). Needs marimo
+0.25+ on the runtime.
 
 ### `nbgpu start NOTEBOOK [--detach] [--fresh] [--gpu G] [--cpu N] [--memory M] [--idle-timeout D] [--max-runtime D] [--backend NAME] [--project-root DIR] [--json]`
 

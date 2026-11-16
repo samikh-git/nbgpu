@@ -1487,6 +1487,7 @@ def _forget(session: Session, store: SessionStore) -> None:
         sync_state_path(session.session_id, store).unlink(missing_ok=True)
     with contextlib.suppress(OSError):
         _last_sync_path(session.session_id, store).unlink(missing_ok=True)
+    _forget_kernel_id(session, store)
     with contextlib.suppress(OSError):
         state = sync_state_path(session.session_id, store)
         state.with_name(state.name + ".lock").unlink(missing_ok=True)
@@ -1607,11 +1608,14 @@ def _bound_output(lines: list[str], max_lines: int, full_output_path: Path) -> s
     keep = max_lines - 1
     head_n = (keep + 1) // 2
     tail_n = keep - head_n
-    omitted = len(lines) - keep
-    marker = f"... {omitted} lines omitted; full output in {full_output_path} ..."
+    marker = _omitted_marker(len(lines) - keep, full_output_path)
     head = lines[:head_n]
     tail = lines[len(lines) - tail_n:] if tail_n else []
     return "\n".join([*head, marker, *tail])
+
+
+def _omitted_marker(omitted: int, full_output_path: Path) -> str:
+    return f"... {omitted} lines omitted; full output in {full_output_path} ..."
 
 
 # Per-file limit for `run --pull`: larger outputs belong on a volume.
@@ -1885,6 +1889,7 @@ def exec_in_kernel(
     sync_first: bool | None = None,
     max_output_lines: int = 200,
     output_dir: Path | None = None,
+    on_line: Callable[[str], None] | None = None,
 ) -> KernelExecResult:
     """Run `code` in the session's live marimo kernel (exactly one of `code`,
     `cells` (names or ids, or "all"), `list_cells`), see nbgpu.kernel.
@@ -1895,7 +1900,13 @@ def exec_in_kernel(
     file watcher has loaded it. Without a kernel, one is started. Unless only
     listing, if no cell has run in the kernel yet, every cell runs first so
     the notebook's variables exist (ran_notebook).
-    Output is bounded like run's (full text under output_dir)."""
+    Output is bounded like run's (full text under output_dir). With
+    `on_line`, output lines are also passed to it as they arrive, bounded
+    the same way (LiveLines): the same lines result.output holds.
+
+    The kernel's stable session id is remembered next to the session's
+    record (`<id>.kernel`), so a call is one request; if marimo no longer
+    knows it, it is looked up (or a kernel created) again."""
     from nbgpu import kernel as kernel_mod
 
     modes = [code is not None, cells is not None, list_cells]
@@ -1928,17 +1939,13 @@ def exec_in_kernel(
         result.env = applied.messages
 
     pieces: list[str] = []
+    live = LiveLines(on_line, max_output_lines) if on_line is not None else None
 
     def collect(channel: str, text: str) -> None:
         pieces.append(text)
+        if live is not None:
+            live.feed(text)
 
-    client = kernel_mod.KernelClient(session.url, session.token)
-    try:
-        session_id, created = client.ensure_kernel(rel_notebook)
-    except kernel_mod.KernelError:
-        _require_handle(session, backend)  # a runtime that is gone is the better error
-        raise
-    result.kernel_created = created
     params: dict[str, object] = {"activity": activity, "prime": True}
     if list_cells:
         params["mode"] = "list"
@@ -1946,9 +1953,25 @@ def exec_in_kernel(
         params.update(mode="code", code=code)
     else:
         params.update(mode="cells", cells="all" if cells == "all" else list(cells or ()))
-        if notebook_pushed and not created:  # a new kernel read the current file
-            params["wait_for"] = remote_notebook
-    outcome = kernel_mod.run_in_kernel(client, session_id, params, collect)
+        if notebook_pushed:
+            params["wait_for"] = remote_notebook  # a kernel created just now matches at once
+
+    client = kernel_mod.KernelClient(session.url, session.token)
+    try:
+        outcome = None
+        cached = _cached_kernel_id(session, store)
+        if cached is not None:
+            try:
+                outcome = kernel_mod.run_in_kernel(client, cached, params, collect)
+            except kernel_mod.UnknownKernelSession:
+                _forget_kernel_id(session, store)  # marimo restarted it, or it was closed
+        if outcome is None:
+            kernel_id, result.kernel_created = client.ensure_kernel(rel_notebook)
+            _remember_kernel_id(session, store, kernel_id)
+            outcome = kernel_mod.run_in_kernel(client, kernel_id, params, collect)
+    except kernel_mod.KernelError:
+        _require_handle(session, backend)  # a runtime that is gone is the better error
+        raise
     result.ok, result.value, result.error, result.cells = outcome.ok, outcome.value, outcome.error, outcome.cells
     result.ran_notebook = outcome.ran_notebook
     if outcome.notebook_error and code is not None:
@@ -1958,15 +1981,95 @@ def exec_in_kernel(
     lines = text.split("\n") if text else []
     if len(lines) <= max_output_lines:
         result.output = text
-        return result
-    if not out_dir.exists():
-        ensure_private_dir(out_dir)
-    stem = posixpath.splitext(posixpath.basename(rel_notebook))[0]
-    fd, name = tempfile.mkstemp(prefix=f"{stem}-exec-{time.strftime('%Y%m%d-%H%M%S')}-", suffix=".log", dir=out_dir)
-    with open(fd, "w", encoding="utf-8") as f:
-        os.fchmod(f.fileno(), 0o600)
-        f.write(text)
-    result.full_output_path = Path(name)
-    result.truncated = True
-    result.output = _bound_output(lines, max_output_lines, result.full_output_path)
+    else:
+        if not out_dir.exists():
+            ensure_private_dir(out_dir)
+        stem = posixpath.splitext(posixpath.basename(rel_notebook))[0]
+        fd, name = tempfile.mkstemp(prefix=f"{stem}-exec-{time.strftime('%Y%m%d-%H%M%S')}-", suffix=".log",
+                                    dir=out_dir)
+        with open(fd, "w", encoding="utf-8") as f:
+            os.fchmod(f.fileno(), 0o600)
+            f.write(text)
+        result.full_output_path = Path(name)
+        result.truncated = True
+        result.output = _bound_output(lines, max_output_lines, result.full_output_path)
+    if live is not None:
+        live.finish(len(lines), result.full_output_path)
     return result
+
+
+class LiveLines:
+    """Passes output lines to `emit` as they arrive, bounded like
+    _bound_output: the first half of `max_lines` at once, the rest held
+    until finish(), which emits them all if the output fit, else the marker
+    line and the last half. The runner's result lines are left out."""
+
+    def __init__(self, emit: Callable[[str], None], max_lines: int) -> None:
+        self._emit = emit
+        keep = max_lines - 1
+        self._head_n = (keep + 1) // 2
+        self._tail_n = keep - self._head_n
+        self._max = max_lines
+        self._held: collections.deque[str] = collections.deque(maxlen=max_lines - self._head_n)
+        self._partial = ""
+        self.count = 0
+
+    def feed(self, text: str) -> None:
+        *complete, self._partial = (self._partial + text).split("\n")
+        for line in complete:
+            self._line(line + "\n")
+
+    def _line(self, raw: str) -> None:
+        from nbgpu.kernel import strip_results
+
+        clean = strip_results(raw)[0]
+        if not clean and raw.strip():
+            return  # only a result line
+        line = clean.rstrip("\n")
+        self.count += 1
+        if self.count <= self._head_n:
+            self._emit(line)
+        else:
+            self._held.append(line)
+
+    def finish(self, total_lines: int, full_output_path: Path | None) -> None:
+        """`total_lines` and `full_output_path` as exec_in_kernel counted
+        and wrote them, so the marker matches result.output's."""
+        if self._partial:
+            self._line(self._partial)
+            self._partial = ""
+        if full_output_path is None:
+            for line in self._held:
+                self._emit(line)
+            return
+        self._emit(_omitted_marker(total_lines - (self._max - 1), full_output_path))
+        held = list(self._held)
+        for line in held[len(held) - self._tail_n:] if self._tail_n else []:
+            self._emit(line)
+
+
+def _kernel_id_path(session_id: str, store: SessionStore) -> Path:
+    return store.directory / f"{session_id}.kernel"
+
+
+def _cached_kernel_id(session: Session, store: SessionStore) -> str | None:
+    with contextlib.suppress(OSError):
+        value = _kernel_id_path(session.session_id, store).read_text(encoding="utf-8").strip()
+        return value or None
+    return None
+
+
+def _remember_kernel_id(session: Session, store: SessionStore, kernel_id: str) -> None:
+    """Only while the session's record exists, so a concurrent stop is not undone."""
+    if store.load(session.session_id) is None:
+        return
+    with contextlib.suppress(OSError):
+        fd, tmp = tempfile.mkstemp(dir=store.directory, prefix=".kernel-", suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(kernel_id)
+        os.replace(tmp, _kernel_id_path(session.session_id, store))
+
+
+def _forget_kernel_id(session: Session, store: SessionStore) -> None:
+    with contextlib.suppress(OSError):
+        _kernel_id_path(session.session_id, store).unlink(missing_ok=True)

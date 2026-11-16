@@ -35,9 +35,10 @@ non-zero on failure with a one-line error on stderr):
   nbgpu exec NOTEBOOK (CODE | -f FILE | --cell NAME... | --all | --list)
                       [--sync | --no-sync] [--max-lines N]
       Run code, or cells, in the live marimo kernel of the notebook's session
-      (lifecycle.exec_in_kernel, nbgpu.kernel). Prints the output and the
-      repr of the code's last expression; exits 1 if it failed. --cell and
-      --all sync first by default; CODE does not.
+      (lifecycle.exec_in_kernel, nbgpu.kernel). Prints the output as it
+      arrives (bounded like run's), then the repr of the code's last
+      expression; exits 1 if it failed. --cell and --all sync first by
+      default; CODE does not.
   nbgpu cost [--days N] [--backend NAME]
       What the provider actually billed for nbgpu's runtimes, per day and per
       resource; also refreshes the cached live prices.
@@ -962,10 +963,13 @@ def exec_(notebook: str, code: str | None, code_file: Any, cells: tuple[str, ...
         raise CliError("give exactly one of: CODE (or --file), --cell, --all, --list")
     store = SessionStore()
     session, backend = _find_session(notebook, store)
+    # Text mode prints output as it arrives (bounded like run's); --json
+    # keeps stdout to the one document.
     result = lifecycle.exec_in_kernel(
         session, backend=backend, store=store, code=code,
         cells="all" if run_all else (list(cells) if cells else None), list_cells=list_cells,
         sync_first=sync_first, max_output_lines=max_lines, output_dir=store.directory / "runs",
+        on_line=None if as_json else _say,
     )
     if as_json:
         _emit_json({
@@ -989,8 +993,6 @@ def exec_(notebook: str, code: str | None, code_file: Any, cells: tuple[str, ...
         click.echo(f"{_c('↑ pushed  ', 'ok')} {path}", err=True)
     if result.ran_notebook:
         click.echo(_c("· no cell had run in the kernel yet: ran the notebook first", "dim"), err=True)
-    if result.output:
-        click.echo(result.output)
     if result.truncated:
         click.echo(_c(f"(output truncated; full output in {result.full_output_path})", "dim"), err=True)
     if list_cells:

@@ -46,6 +46,11 @@ class KernelError(Exception):
     """The kernel could not be reached or asked."""
 
 
+class UnknownKernelSession(KernelError):
+    """marimo does not know the stable session id (a remembered one that is
+    gone): look it up again. marimo answers 404 "Invalid stable session id"."""
+
+
 RELOAD_WAIT_S = 15.0  # for marimo's file watcher to load a pushed notebook
 RELOAD_POLL_S = 0.2
 
@@ -137,6 +142,8 @@ class KernelClient:
                 pass
             if exc.code in (401, 403):
                 raise KernelError("marimo refused the session's token") from None
+            if "Invalid stable session id" in detail:
+                raise UnknownKernelSession(detail[:200]) from None
             if exc.code == 404 and path.startswith("/api/kernel/execute"):
                 raise KernelError(
                     "this marimo has no kernel execute API (`nbgpu exec` needs marimo 0.25 or newer); "

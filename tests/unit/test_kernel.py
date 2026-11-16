@@ -130,3 +130,55 @@ def test_main_prints_one_result_line_and_touches_the_activity_file(tmp_path) -> 
     parsed = kernel.parse_result(out.getvalue(), "")
     assert parsed.ok and parsed.value == "2"
     assert activity.exists()
+
+
+# ---------------------------------------------------------------------------
+# lifecycle.LiveLines: streaming output, bounded like run's
+
+
+def live(text_chunks: list[str], max_lines: int, path=None) -> list[str]:
+    from nbgpu.lifecycle import LiveLines
+
+    out: list[str] = []
+    stream = LiveLines(out.append, max_lines)
+    for chunk in text_chunks:
+        stream.feed(chunk)
+    total = len(kernel.strip_results("".join(text_chunks))[0].rstrip("\n").split("\n"))
+    stream.finish(total, path)
+    return out
+
+
+def test_live_lines_pass_short_output_through() -> None:
+    assert live(["a\nb", "\nc\n"], 10) == ["a", "b", "c"]
+
+
+def test_live_lines_leave_out_result_lines_even_mid_line() -> None:
+    assert live(["x\n", "partial" + result_line(value="1")], 10) == ["x", "partial"]
+    assert live([result_line(value="1")], 10) == []
+
+
+def test_live_lines_match_the_bounded_output(tmp_path) -> None:
+    from nbgpu.lifecycle import _bound_output
+
+    lines = [f"row {i}" for i in range(30)]
+    path = tmp_path / "full.log"
+    for max_lines in (1, 2, 9, 10):
+        streamed = live(["\n".join(lines) + "\n"], max_lines, path)
+        assert streamed == _bound_output(lines, max_lines, path).split("\n"), max_lines
+
+
+def test_live_lines_emit_the_head_before_finish() -> None:
+    from nbgpu.lifecycle import LiveLines
+
+    out: list[str] = []
+    stream = LiveLines(out.append, 10)
+    stream.feed("one\ntwo\n")
+    assert out == ["one", "two"]  # live, not at the end
+    stream.feed("three")
+    assert out == ["one", "two"]  # an unfinished line waits for its newline
+    stream.finish(3, None)
+    assert out == ["one", "two", "three"]
+
+
+def test_unknown_session_is_a_kernel_error() -> None:
+    assert issubclass(kernel.UnknownKernelSession, kernel.KernelError)

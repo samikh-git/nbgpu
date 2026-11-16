@@ -72,6 +72,11 @@ reason, so do not bind them as default arguments.
   `_nbgpu*` names (it runs in the user's kernel namespace), and must never
   wait inside the kernel for something the kernel itself has to do (a file
   reload): return `pending` and let `kernel.run_in_kernel` retry.
+- **`exec` streams through `lifecycle.LiveLines`**, which must emit
+  exactly the lines `result.output` holds (tested against
+  `_bound_output`). The kernel id cache (`<id>.kernel`) is removed in
+  `_forget`; a stale id surfaces as `UnknownKernelSession` before any
+  output, so the retry never duplicates output.
 - **`exec` leaves no websocket connected.** A connected client makes the
   user's browser a read-only viewer.
 - **`--json` stdout is one JSON document.** Progress goes to stderr.

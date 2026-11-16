@@ -212,3 +212,30 @@ def test_kernel_client_reports_a_missing_server() -> None:
     client = KernelClient("http://127.0.0.1:9", "token")
     with pytest.raises(kernel.KernelError, match="could not reach marimo"):
         client.sessions()
+
+
+def test_output_arrives_while_the_code_runs(session, local_backend, store, tmp_path: Path) -> None:
+    assert ex(session, local_backend, store, tmp_path, code="1").ok  # kernel up, notebook run
+    seen: list[tuple[float, str]] = []
+    start = time.monotonic()
+    result = ex(session, local_backend, store, tmp_path,
+                code="import time\nprint('first', flush=True)\ntime.sleep(2)\nprint('second')",
+                on_line=lambda line: seen.append((time.monotonic() - start, line)))
+    assert result.ok
+    assert [line for _, line in seen] == ["first", "second"] == result.output.split("\n")
+    assert seen[1][0] - seen[0][0] >= 1.5, seen  # the first line did not wait for the end
+
+
+def test_the_kernel_id_is_remembered_and_renewed(session, local_backend, store, tmp_path: Path) -> None:
+    cache = store.directory / f"{session.session_id}.kernel"
+    assert ex(session, local_backend, store, tmp_path, code="1").ok
+    remembered = cache.read_text()
+    assert remembered.startswith("sess-")
+
+    cache.write_text("sess-gone")  # e.g. the kernel was closed
+    again = ex(session, local_backend, store, tmp_path, code="x")
+    assert again.ok and again.value == "1" and not again.kernel_created
+    assert cache.read_text() == remembered
+
+    lifecycle.stop(session, backend=local_backend, store=store, force=True)
+    assert not cache.exists()
