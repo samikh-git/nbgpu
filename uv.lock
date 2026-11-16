@@ -1004,7 +1004,6 @@ wheels = [
 
 [[package]]
 name = "nbgpu"
-version = "0.0.1"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },

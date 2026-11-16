@@ -52,6 +52,10 @@ non-zero on failure with a one-line error on stderr):
       List untracked runtimes of this state directory and terminate them
       (after a confirmation unless --yes; --json requires --yes). Runtimes of
       other owners are never touched.
+  nbgpu skills install [--dir DIR] [--link] [--force]
+      Install the bundled agent skills (nbgpu, nbgpu-notebook) into DIR
+      (default ~/.claude/skills) as copies, or symlinks with --link
+      (nbgpu.skills). Targets nbgpu did not create are skipped unless --force.
 
 Backend choice: --backend, else $NBGPU_BACKEND, else the spec's provider.
 State directory: $NBGPU_STATE_DIR (see session.default_state_dir).
@@ -86,6 +90,7 @@ Errors: one line on stderr, no traceback, non-zero exit.
            "total_usd", "prices_refreshed", "prices_error"}
   run:    {"exit_code", "output", "truncated", "full_output_path",
            "pulled" (files brought back after the run), "warnings", "env"}
+  skills install: {"dest", "installed", "replaced", "skipped": {name: reason}}
   exec:   {"ok", "value", "error", "output", "truncated", "full_output_path",
            "cells", "kernel_created", "ran_notebook", "pushed", "warnings", "env"}
            (exit code 0 when ok, else 1, with the document still printed)
@@ -119,7 +124,7 @@ from typing import Any, NoReturn
 
 import click
 
-from nbgpu import cost, lifecycle, watchdog
+from nbgpu import cost, lifecycle, skills, watchdog
 from nbgpu.backends import get_backend
 from nbgpu.backends.base import Backend, RuntimeHandle
 from nbgpu.cost import Rate, format_usd
@@ -1083,6 +1088,35 @@ def _stop_orphans(store: SessionStore, backend_name: str | None, *, yes: bool, a
         for rid, error in result.failed.items():
             click.echo(f"{_c('FAILED', 'error')} to terminate {rid}: {_one_line(error)}", err=True)
     if result.failed:
+        sys.exit(1)
+
+
+@main.group(name="skills")
+def skills_() -> None:
+    """Agent skills bundled with nbgpu."""
+
+
+@skills_.command(name="install")
+@click.option("--dir", "dest", type=click.Path(file_okay=False, path_type=Path),
+              help=f"Skills directory (default: {skills.DEFAULT_DEST}).")
+@click.option("--link", is_flag=True, help="Symlink to the installed package instead of copying.")
+@click.option("--force", is_flag=True, help="Replace existing skills nbgpu did not install.")
+@json_option
+def skills_install(dest: Path | None, link: bool, force: bool, as_json: bool) -> None:
+    """Install the nbgpu and nbgpu-notebook skills for your agent."""
+    result = skills.install_skills(dest, link=link, force=force)
+    if as_json:
+        _emit_json({"dest": str(result.dest), "installed": result.installed,
+                    "replaced": result.replaced, "skipped": result.skipped})
+    else:
+        how = "linked" if link else "copied"
+        for name in result.installed:
+            click.echo(f"{_c('✓', 'ok')} {how} {name} -> {result.dest / name}")
+        for name in result.replaced:
+            click.echo(f"{_c('✓', 'ok')} updated {name} -> {result.dest / name}")
+        for reason in result.skipped.values():
+            click.echo(f"{_c('skipped', 'warn')}: {reason}", err=True)
+    if result.skipped:
         sys.exit(1)
 
 

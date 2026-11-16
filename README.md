@@ -26,16 +26,20 @@ editable by you, your editor and your agents. Only the kernel is remote.
 
 ## Install
 
-Requires Python 3.11+, [uv](https://docs.astral.sh/uv/), `git` (used for
-three-way merges) and a [Modal](https://modal.com) account.
+With Homebrew (macOS or Linux):
 
-From a checkout:
+```bash
+brew install samikh-git/tools/nbgpu
+```
+
+Or with [uv](https://docs.astral.sh/uv/), from a checkout (Python 3.11+):
 
 ```bash
 uv tool install --editable .
 ```
 
-Then log in to Modal once:
+Sync needs `git` on your `PATH` (for three-way merges). Then log in to
+[Modal](https://modal.com) once:
 
 ```bash
 modal setup
@@ -78,16 +82,22 @@ modal setup
 
 ## Agent skills
 
-Three skills ship in this repository:
+Two skills ship with the package, and a third with this repository:
 
 | Skill | For |
 |-------|-----|
-| [`skills/nbgpu`](skills/nbgpu/SKILL.md) | Running notebooks remotely: modes, results, cost, conflicts |
-| [`skills/nbgpu-notebook`](skills/nbgpu-notebook/SKILL.md) | Writing notebooks and headers that work remotely and in script mode |
-| [`.claude/skills/nbgpu-dev`](.claude/skills/nbgpu-dev/SKILL.md) | Working on nbgpu itself |
+| [`nbgpu`](src/nbgpu/skills/nbgpu/SKILL.md) | Running notebooks remotely: modes, results, cost, conflicts |
+| [`nbgpu-notebook`](src/nbgpu/skills/nbgpu-notebook/SKILL.md) | Writing notebooks and headers that work remotely and in script mode |
+| [`nbgpu-dev`](.claude/skills/nbgpu-dev/SKILL.md) | Working on nbgpu itself |
 
-They are active in this repository as-is. To use the first two in every
-project, see [Using nbgpu with agents](docs/agents.md#installing-the-skills).
+All three are active in this repository as-is. To use the first two in every
+project:
+
+```bash
+nbgpu skills install     # copies them into ~/.claude/skills
+```
+
+See [Using nbgpu with agents](docs/agents.md#installing-the-skills).
 
 ## Development
 

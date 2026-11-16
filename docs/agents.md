@@ -110,8 +110,8 @@ The bundled skills cover these, but if you are writing your own instructions:
 
 | Skill | Use |
 |-------|-----|
-| [`nbgpu`](../skills/nbgpu/SKILL.md) | Operating the CLI: choosing a mode, reading results, cost and cleanup, conflicts. Carries a JSON reference and a troubleshooting table. |
-| [`nbgpu-notebook`](../skills/nbgpu-notebook/SKILL.md) | Authoring: the header, marimo's cell rules, writing for script mode, converting from Jupyter. |
+| [`nbgpu`](../src/nbgpu/skills/nbgpu/SKILL.md) | Operating the CLI: choosing a mode, reading results, cost and cleanup, conflicts. Carries a JSON reference and a troubleshooting table. |
+| [`nbgpu-notebook`](../src/nbgpu/skills/nbgpu-notebook/SKILL.md) | Authoring: the header, marimo's cell rules, writing for script mode, converting from Jupyter. |
 | [`nbgpu-dev`](../.claude/skills/nbgpu-dev/SKILL.md) | Changing nbgpu itself: module map, invariants, tests, how to add a key, flag or backend. |
 
 Skills are folders with a `SKILL.md`. An agent that supports them reads the
@@ -119,28 +119,26 @@ short description up front and loads the body only when a task matches.
 
 ### Installing the skills
 
+`nbgpu` and `nbgpu-notebook` ship inside the package, matching the CLI
+version you have. Install them for every project:
+
+```bash
+nbgpu skills install
+```
+
+That copies them into `~/.claude/skills`; run it again after upgrading
+nbgpu. `--dir` picks another skills directory (a single project's
+`.claude/skills/`, or wherever another agent reads `SKILL.md` folders), and
+`--link` symlinks instead of copying, which keeps them current from an
+editable checkout.
+
 Inside this repository all three are already active for Claude Code:
-`.claude/skills/` holds `nbgpu-dev` and links to the other two.
-
-To have `nbgpu` and `nbgpu-notebook` in every project, link them into your
-user skills directory from a checkout of this repository:
-
-```bash
-ln -s "$PWD/skills/nbgpu" ~/.claude/skills/nbgpu
-```
-
-```bash
-ln -s "$PWD/skills/nbgpu-notebook" ~/.claude/skills/nbgpu-notebook
-```
-
-Symlinks keep them current as the repository changes. For a single other
-project, link or copy them into that project's `.claude/skills/` instead.
-Other agents that read `SKILL.md` folders can be pointed at `skills/`
-directly.
+`.claude/skills/` holds `nbgpu-dev` and links to the other two in
+`src/nbgpu/skills/`.
 
 ### Keeping them honest
 
 The skills describe the CLI's behaviour, so they go stale the same way docs
 do. When a flag, a JSON field or a limit changes, update
-`skills/nbgpu/references/cli.md` and the matching page here in the same
+`src/nbgpu/skills/nbgpu/references/cli.md` and the matching page here in the same
 change. The `nbgpu-dev` skill tells agents working on the code to do this.

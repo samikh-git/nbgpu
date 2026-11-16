@@ -162,6 +162,15 @@ start may still own them).
 {"orphans": [...], "terminated": ["sb-..."], "skipped": [], "failed": {}}
 ```
 
+### `nbgpu skills install [--dir DIR] [--link] [--force] [--json]`
+
+Copies these skills (or symlinks them with `--link`) into DIR, default
+`~/.claude/skills`. Exits 1 if a folder it did not create is in the way.
+
+```json
+{"dest": "...", "installed": ["nbgpu", "nbgpu-notebook"], "replaced": [], "skipped": {}}
+```
+
 ### `nbgpu open NOTEBOOK [--json]`
 
 Prints the `start` shape for the running session and resumes the sync loop.

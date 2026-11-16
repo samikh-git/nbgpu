@@ -22,6 +22,7 @@ description: Work on the nbgpu codebase itself (this repository). Use when chang
 | `proxy.py` | Localhost proxy serving marimo's static assets from this machine. |
 | `cost.py` | Price sources in order: `$NBGPU_PRICES`, cached live rates (`prices-live.json` in the state dir), `prices.toml`; rates, running totals, the "as of" disclaimer. |
 | `session.py` | Session records on disk (state directory). |
+| `skills.py` | The bundled agent skills (`skills/`) and `nbgpu skills install`. |
 | `backends/base.py` | The provider contract (`Backend` protocol). |
 | `backends/modal.py`, `backends/local.py` | Implementations. |
 
@@ -89,11 +90,11 @@ reason, so do not bind them as default arguments.
 `NotebookSpec`; honour it in each backend or raise `UnsupportedError`; decide
 in `envsync.snapshot` whether a change mid-session is reported; test in
 `tests/unit/test_spec.py`; document in `docs/notebook-header.md` and
-`skills/nbgpu-notebook/SKILL.md`.
+`src/nbgpu/skills/nbgpu-notebook/SKILL.md`.
 
 **A new CLI flag or command**: implement in `lifecycle.py`, wire in `cli.py`
 with `--json`, update the `cli.py` docstring, `docs/cli.md` and
-`skills/nbgpu/references/cli.md`.
+`src/nbgpu/skills/nbgpu/references/cli.md`.
 
 **A new backend**: implement `Backend` from `backends/base.py`, register it
 in `backends/__init__.py` (`KNOWN_BACKENDS`, lazy import in `get_backend`),
@@ -147,6 +148,6 @@ separate `NBGPU_STATE_DIR` keeps test sessions away from real ones.
 
 ## Docs and skills travel with the code
 
-User docs are in `docs/`, agent skills in `skills/` (usage) and
+User docs are in `docs/`, agent skills in `src/nbgpu/skills/` (usage, shipped in the package and installed by `nbgpu skills install`) and
 `.claude/skills/` (this one). A behaviour change that a user or agent would
 notice is not done until those say the same thing as the code.

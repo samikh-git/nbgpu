@@ -44,6 +44,7 @@ commands.
 | `cost.py` | Price sources (`NBGPU_PRICES`, cached live rates, `prices.toml`); hourly rate, cost so far. |
 | `prices.toml` | The price table: list prices per second, with the date they were checked. |
 | `session.py` | `Session` records and `SessionStore`. |
+| `skills.py` | The agent skills bundled in `skills/`; `nbgpu skills install`. |
 | `backends/base.py` | The `Backend` protocol. |
 | `backends/modal.py` | Modal Sandboxes. |
 | `backends/local.py` | Same contract on this machine, for tests and trials. |

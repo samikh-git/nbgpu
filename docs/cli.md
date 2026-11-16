@@ -10,6 +10,7 @@ nbgpu status             every session, cost so far, untracked runtimes
 nbgpu cost               what the provider actually billed
 nbgpu stop    NOTEBOOK   final pull, terminate, remove the record
 nbgpu stop --orphans     terminate runtimes that lost their record
+nbgpu skills install     install the bundled agent skills
 ```
 
 Conventions that hold for every command:
@@ -384,6 +385,22 @@ other owners are never touched.
 
 ```json
 {"orphans": [...], "terminated": ["sb-..."], "skipped": [], "failed": {}}
+```
+
+## `nbgpu skills install`
+
+```text
+nbgpu skills install [--dir DIR] [--link] [--force] [--json]
+```
+
+Installs the `nbgpu` and `nbgpu-notebook` agent skills that ship with this
+version into DIR (default `~/.claude/skills`). They are copied, so run it
+again after upgrading nbgpu; `--link` symlinks to the installed package
+instead (useful with an editable install). A skill folder nbgpu did not put
+there is left alone and the command exits 1, unless `--force`.
+
+```json
+{"dest": "/Users/me/.claude/skills", "installed": ["nbgpu", "nbgpu-notebook"], "replaced": [], "skipped": {}}
 ```
 
 ## Environment variables

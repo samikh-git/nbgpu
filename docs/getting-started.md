@@ -2,14 +2,21 @@
 
 ## Install
 
-You need Python 3.11 or newer, [uv](https://docs.astral.sh/uv/), and `git` on
-your `PATH` (sync uses `git merge-file` for three-way merges).
+With Homebrew:
 
-From a checkout of this repository:
+```bash
+brew install samikh-git/tools/nbgpu
+```
+
+Or from a checkout of this repository, with
+[uv](https://docs.astral.sh/uv/) and Python 3.11 or newer:
 
 ```bash
 uv tool install --editable .
 ```
+
+Either way you need `git` on your `PATH` (sync uses `git merge-file` for
+three-way merges).
 
 ```bash
 nbgpu --version

@@ -5,3 +5,4 @@ __pycache__/
 dist/
 .nbgpu/
 samples/
+__marimo__/
